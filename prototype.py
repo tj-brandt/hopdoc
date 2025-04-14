@@ -3,17 +3,16 @@ Streamlit web application for my MS Thesis Experiment.
 
 This app simulates a health chatbot (HopDoc) with different conditions
 to test user perceptions based on avatar presence and linguistic style matching (LSM).
-It uses the Google Gemini API for generating responses.
+It uses OpenRouter's API to access the specified LLM for generating responses.
 """
 
 import streamlit as st
 import time
 import random
-import google.generativeai as genai
-import os # Needed for path joining if debugging secrets, but primarily using st.secrets
+import requests # Using requests library for OpenRouter API calls
+import os
 
 # --- Page Configuration (Must be the first Streamlit command!) ---
-# I'm setting the layout to "wide" to give the elements more space.
 st.set_page_config(layout="wide")
 
 # --- Global Configuration & Constants ---
@@ -21,36 +20,38 @@ st.set_page_config(layout="wide")
 AVATAR_IMAGE_PATH = "franko.png" # Path to the main Franko avatar image
 DEFAULT_BOT_NAME = "HopDoc (Franko)" # Name used when avatar is visible
 NO_AVATAR_BOT_NAME = "HopDoc" # Name used when no avatar is shown
-# Using the specific experimental model I selected.
-GEMINI_MODEL_NAME = "gemini-2.0-flash-thinking-exp-01-21"
+
+# --- OpenRouter Configuration ---
+OPENROUTER_MODEL_NAME = "google/gemini-2.5-pro-exp-03-25:free" # Your selected OpenRouter model
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Your Streamlit app's URL - REQUIRED for the HTTP-Referer header by OpenRouter
+APP_URL = "https://hopdoc.streamlit.app/"
+# --- End OpenRouter Config ---
+
 SESSION_TIMEOUT_SECONDS = 600 # 10 minutes for the interaction
 
-# --- API Key & Gemini Client Setup ---
-# I need to configure the Gemini client using the API key.
-# I'm using Streamlit's secrets management for security.
+# --- API Key Setup (Using OpenRouter Key) ---
+# I need the OpenRouter API key from Streamlit secrets.
 try:
     # This tries to load the key from `.streamlit/secrets.toml`
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-    genai.configure(api_key=GOOGLE_API_KEY)
-    # You could add a silent success log here if needed for deployment checks
-    # print("Gemini API Key configured successfully.")
+    OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
 except KeyError:
     # This error means the secrets file exists, but the key isn't IN it.
-    st.error("🚨 Oops! Your `GOOGLE_API_KEY` was not found in the Streamlit secrets. Please add it.")
+    st.error("🚨 Oops! Your `OPENROUTER_API_KEY` was not found in the Streamlit secrets. Please add it.")
     st.stop() # Stop the app if the key is missing.
 except Exception as e:
-    # Catch any other unexpected errors during configuration.
-    st.error(f"🚨 An error occurred while configuring the Gemini API: {e}")
+    # Catch any other unexpected errors during secret access.
+    st.error(f"🚨 An error occurred while accessing secrets: {e}")
     st.stop()
 
 # --- Core Functions ---
 
-def get_gemini_response(user_prompt, chat_history, is_adaptive, show_avatar):
+def get_openrouter_response(user_prompt, chat_history, is_adaptive, show_avatar):
     """
-    Fetches a response from the configured Gemini model.
+    Fetches a response from the specified model via OpenRouter's API.
 
-    I engineered the system prompts here to simulate the different experimental
-    conditions (Static vs. Adaptive Linguistic Style).
+    Uses standard HTTP requests and handles OpenRouter's specific requirements
+    like headers and JSON format. System prompts are included as the first message.
     """
     # Determine the persona name based on the avatar condition
     persona_name = DEFAULT_BOT_NAME if show_avatar else NO_AVATAR_BOT_NAME
@@ -74,43 +75,75 @@ def get_gemini_response(user_prompt, chat_history, is_adaptive, show_avatar):
         Remember the disclaimer: you are not a medical professional.
         """
 
-    # Format the chat history for the Gemini API.
-    # It expects a specific structure with 'role' and 'parts'.
-    messages_for_api = []
+    # Format messages for OpenRouter (OpenAI compatible format)
+    # System instruction goes first
+    messages_for_api = [{"role": "system", "content": system_instruction_text}]
     for message in chat_history:
-        role = "model" if message["role"] == "assistant" else message["role"]
-        messages_for_api.append({"role": role, "parts": [{"text": message["content"]}]})
+        # Use 'assistant' role for OpenRouter/OpenAI standard
+        role = "assistant" if message["role"] == "assistant" else message["role"]
+        messages_for_api.append({"role": role, "content": message["content"]})
 
-    # Add the latest user prompt in the required format
-    messages_for_api.append({"role": "user", "parts": [{"text": user_prompt}]})
+    # Add the latest user prompt
+    messages_for_api.append({"role": "user", "content": user_prompt})
 
-    # Call the Gemini API
+    # Define headers for the OpenRouter API call
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": APP_URL, # Required by OpenRouter
+        # Optional: Identify your app - helps OpenRouter analytics
+        "X-Title": "HopDoc Thesis Prototype",
+    }
+
+    # Define the JSON payload for the request
+    payload = {
+        "model": OPENROUTER_MODEL_NAME,
+        "messages": messages_for_api,
+        # Add other parameters like temperature, max_tokens if needed
+        # "temperature": 0.7,
+        # "max_tokens": 500,
+    }
+
+    # Make the API call using the 'requests' library
     try:
-        # Initialize the model with the appropriate system instruction
-        model = genai.GenerativeModel(
-            GEMINI_MODEL_NAME,
-            system_instruction=system_instruction_text
-        )
-        # Generate the response based on the formatted history + new prompt
-        response = model.generate_content(messages_for_api)
+        # Set a timeout (e.g., 60 seconds) to prevent hanging indefinitely
+        response = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=60)
+        response.raise_for_status() # Raises an HTTPError for bad responses (4XX or 5XX)
 
-        # I need to handle cases where the API might block the response or return nothing.
-        if not response.candidates or not response.candidates[0].content.parts:
-             if response.prompt_feedback and response.prompt_feedback.block_reason:
-                 # Inform the user if the response was blocked for safety reasons
-                 return f"Response blocked due to: {response.prompt_feedback.block_reason}. Let's try a different topic."
-             else:
-                 # Generic fallback if no response content is found
-                 return "Sorry, I couldn't generate a response for that. Could you rephrase or ask about something else?"
+        response_data = response.json()
 
-        # If successful, return the generated text content
-        return response.text
+        # Extract the response content - check structure carefully
+        if "choices" in response_data and len(response_data["choices"]) > 0:
+            # Accessing the nested structure typical of OpenAI compatible APIs
+            message_content = response_data["choices"][0]["message"]["content"]
+            return message_content.strip() # Remove leading/trailing whitespace
+        else:
+            # Handle cases where the response structure is unexpected
+            print(f"Unexpected OpenRouter response format: {response_data}")
+            return "Sorry, I received an unexpected response format. Please try again."
 
-    except Exception as e:
-        # Log the detailed error to the console during development/debugging
-        print(f"Gemini API Error Details: {type(e).__name__} - {e}")
-        # Provide a user-friendly error message in the chat interface
-        return "Sorry, I encountered an error trying to respond. Please try again."
+    # Catch specific requests errors
+    except requests.exceptions.RequestException as e:
+        print(f"OpenRouter API Request Error: {type(e).__name__} - {e}")
+        # Provide more specific user feedback based on error type
+        if isinstance(e, requests.exceptions.Timeout):
+            return "Sorry, the request timed out. The service might be busy. Please try again."
+        elif isinstance(e, requests.exceptions.ConnectionError):
+            return "Sorry, I couldn't connect to the response service. Please check your network."
+        elif isinstance(e, requests.exceptions.HTTPError):
+            # Try to get more details from the response body if available
+            try:
+                error_detail = response.json()
+                error_msg = error_detail.get('error', {}).get('message', response.text)
+                return f"Sorry, the API returned an error ({response.status_code}): {error_msg}"
+            except: # If parsing response fails
+                return f"Sorry, the API returned an error: {response.status_code} - {response.reason}"
+        # Generic fallback for other request errors
+        return "Sorry, an error occurred while communicating with the response service."
+    # Catch potential errors during JSON parsing or key access
+    except (KeyError, IndexError, Exception) as e:
+        print(f"Error processing OpenRouter response: {type(e).__name__} - {e}")
+        return "Sorry, I encountered an error processing the response. Please try again."
 
 
 def display_welcome_disclaimer(show_avatar_in_welcome):
@@ -166,8 +199,8 @@ def display_welcome_disclaimer(show_avatar_in_welcome):
                 st.session_state.start_time = time.time() # Record the start time
                 st.session_state.messages = [] # Ensure chat history is clear
 
-                # Generate the initial greeting from the bot based on the starting condition
-                initial_greeting = get_gemini_response(
+                # Generate the initial greeting from the bot using OpenRouter
+                initial_greeting = get_openrouter_response( # <-- UPDATED FUNCTION NAME
                     user_prompt="<User just started the chat>", # Placeholder to trigger a greeting
                     chat_history=[],
                     is_adaptive=st.session_state.experiment_condition['lsm'],
@@ -196,39 +229,30 @@ def display_welcome_disclaimer(show_avatar_in_welcome):
 # --- Initialize Session State ---
 # I need to set up default values for variables that persist across user interactions.
 if 'messages' not in st.session_state:
-    # Stores the chat history (list of dicts)
-    st.session_state.messages = []
+    st.session_state.messages = [] # Stores the chat history
 if 'disclaimer_accepted' not in st.session_state:
-    # Tracks if the user has passed the initial disclaimer screens
-    st.session_state.disclaimer_accepted = False
+    st.session_state.disclaimer_accepted = False # Tracks disclaimer progress
 if 'experiment_condition' not in st.session_state:
     # Stores the current experimental setup (avatar T/F, LSM T/F)
-    # I'll start with Avatar + Adaptive LSM as the default view.
     st.session_state.experiment_condition = {'avatar': True, 'lsm': True}
 if 'start_time' not in st.session_state:
-    # Records when the user clicks "Let's Begin!" to track interaction time
-    st.session_state.start_time = None
+    st.session_state.start_time = None # Tracks interaction start time
 
 # --- Sidebar: Experiment Controls (For Researcher) ---
-# This section allows me (the researcher) to easily switch conditions.
 st.sidebar.title("Experiment Setup")
 st.sidebar.write("*(Control Panel for Researcher)*")
 
 # Radio buttons to select the Avatar Presence condition
 avatar_option = st.sidebar.radio(
-    "Avatar Presence:",
-    ('Avatar Visible', 'No Avatar'),
-    # Set default based on session state
+    "Avatar Presence:", ('Avatar Visible', 'No Avatar'),
     index=0 if st.session_state.experiment_condition['avatar'] else 1,
-    key="avatar_radio" # Added key for stability
+    key="avatar_radio"
 )
 # Radio buttons to select the Linguistic Style condition
 lsm_option = st.sidebar.radio(
-    "Linguistic Style:",
-    ('Adaptive LSM (Simulated)', 'Static Style'),
-    # Set default based on session state
+    "Linguistic Style:", ('Adaptive LSM (Simulated)', 'Static Style'),
     index=0 if st.session_state.experiment_condition['lsm'] else 1,
-    key="lsm_radio" # Added key for stability
+    key="lsm_radio"
 )
 
 # Determine current settings based on radio button selections
@@ -236,18 +260,11 @@ show_avatar_setting = (avatar_option == 'Avatar Visible')
 use_adaptive_lsm_setting = (lsm_option == 'Adaptive LSM (Simulated)')
 
 # Update the session state ONLY if a condition has actually changed
-# This prevents unnecessary resets or reruns if the user just re-clicks the same option.
 if st.session_state.experiment_condition['avatar'] != show_avatar_setting or \
    st.session_state.experiment_condition['lsm'] != use_adaptive_lsm_setting:
     st.session_state.experiment_condition['avatar'] = show_avatar_setting
     st.session_state.experiment_condition['lsm'] = use_adaptive_lsm_setting
-    # NOTE: Changing condition mid-chat might be confusing for the user/data.
-    # For a real experiment, I'd likely assign conditions *before* the user starts
-    # and potentially disable these controls during the participant interaction.
-    # Consider uncommenting below if a reset is desired on condition change:
-    # st.session_state.messages = []
-    # st.session_state.start_time = None # Reset timer too?
-    # st.rerun()
+    # Add note about real experiment setup - conditions likely fixed beforehand.
 
 # Display the currently active condition for confirmation
 st.sidebar.markdown("---")
@@ -258,9 +275,8 @@ st.sidebar.write(f"- Style: {'Adaptive (Simulated)' if st.session_state.experime
 
 # --- Main App Interface ---
 
-# Show disclaimer first, then the chat interface
 if not st.session_state.disclaimer_accepted:
-    # Pass the current avatar setting to the disclaimer display function
+    # Show disclaimer screens first
     display_welcome_disclaimer(show_avatar_in_welcome=st.session_state.experiment_condition['avatar'])
 else:
     # --- Chat Interface ---
@@ -274,11 +290,10 @@ else:
         timer_display = f"Time elapsed: {int(minutes):02}:{int(seconds):02} / {int(SESSION_TIMEOUT_SECONDS / 60):02}:00"
         time_limit_reached = elapsed_time > SESSION_TIMEOUT_SECONDS
     else:
-        # Should ideally not happen if disclaimer_accepted is True, but safer
         timer_display = "Timer not started."
 
     # Define the main layout with columns for the avatar and the chat
-    avatar_col, chat_col = st.columns([0.3, 0.7], gap="large") # Adjust ratio as needed
+    avatar_col, chat_col = st.columns([0.3, 0.7], gap="large")
 
     # --- Avatar Column ---
     with avatar_col:
@@ -291,8 +306,7 @@ else:
             except Exception as e:
                 st.error(f"Error loading large avatar: {e}")
         else:
-            # Keep the column structure even if empty
-            st.write("")
+            st.write("") # Keep column structure
 
     # --- Chat Column ---
     with chat_col:
@@ -301,20 +315,15 @@ else:
         if time_limit_reached:
             st.warning("Interaction time limit reached. Please complete the survey.")
 
-        # Determine the small icon to use next to assistant messages
-        # I decided *not* to show the small icon if the large avatar is present,
-        # but uncomment the first line if you prefer to show both.
-        # use_small_avatar_icon = AVATAR_IMAGE_PATH if st.session_state.experiment_condition['avatar'] else None
-        use_small_avatar_icon = None # Set to None if large avatar is primary visual
+        # Determine the small icon to use next to assistant messages (set to None)
+        use_small_avatar_icon = None
 
         # Display existing chat messages from history
         for message in st.session_state.messages:
-            # Use the 'small_avatar_used' key stored with the message for consistency
             with st.chat_message(message["role"], avatar=message.get("small_avatar_used")):
                 st.markdown(message["content"])
 
         # Get user input using the chat input widget
-        # Disable input if the time limit has been reached
         if prompt := st.chat_input("What health questions do you have?", disabled=time_limit_reached, key="chat_input"):
 
             # 1. Display and store the user's message
@@ -323,14 +332,13 @@ else:
             st.session_state.messages.append({
                 "role": "user",
                 "content": prompt,
-                "small_avatar_used": None # User messages don't have an avatar icon
+                "small_avatar_used": None
                 })
 
-            # 2. Generate and display the assistant's response
+            # 2. Generate and display the assistant's response using OpenRouter
             with st.chat_message("assistant", avatar=use_small_avatar_icon):
-                # Show a thinking indicator while waiting for the API
                 with st.spinner("Thinking..."):
-                    response = get_gemini_response(
+                    response = get_openrouter_response( # <-- UPDATED FUNCTION NAME
                         prompt,
                         st.session_state.messages, # Pass full history
                         is_adaptive=st.session_state.experiment_condition['lsm'],
@@ -342,9 +350,8 @@ else:
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": response,
-                "small_avatar_used": use_small_avatar_icon # Store the icon used
+                "small_avatar_used": use_small_avatar_icon
                 })
 
-            # Rerun the script immediately after processing input/output.
-            # This ensures the new messages are displayed correctly and the input box is ready.
+            # Rerun script for immediate display update
             st.rerun()
