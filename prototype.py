@@ -3,278 +3,277 @@ Streamlit web application for my MS Thesis Experiment.
 
 This app simulates a health chatbot (HopDoc) with different conditions
 to test user perceptions based on avatar presence and linguistic style matching (LSM).
-It uses the Google Gemini API for generating responses.
+It uses the Google Gemini API for generating responses and includes an enhanced
+LSM simulation based on detected user style traits.
 """
 
 import streamlit as st
 import time
 import random
 import google.generativeai as genai
-import os # Needed for path joining if debugging secrets, but primarily using st.secrets
+import os
+import re # Needed for regex-based style detection
 
 # --- Page Configuration (Must be the first Streamlit command!) ---
-# I'm setting the layout to "wide" to give the elements more space.
 st.set_page_config(layout="wide")
 
 # --- Global Configuration & Constants ---
-# Here I define the core settings and filenames for the app.
-AVATAR_IMAGE_PATH = "franko.png" # Path to the main Franko avatar image
-DEFAULT_BOT_NAME = "HopDoc (Franko)" # Name used when avatar is visible
-NO_AVATAR_BOT_NAME = "HopDoc" # Name used when no avatar is shown
+AVATAR_IMAGE_PATH = "franko.png"
+DEFAULT_BOT_NAME = "HopDoc (Franko)"
+NO_AVATAR_BOT_NAME = "HopDoc"
 # Using the specific experimental model I selected.
 GEMINI_MODEL_NAME = "gemini-2.0-flash-thinking-exp-01-21"
 SESSION_TIMEOUT_SECONDS = 600 # 10 minutes for the interaction
 
+# --- Lists for Style Detection ---
+INFORMAL_WORDS = r"\b(bruh|yo|dude|lol|lmao|deadass|ain't|gonna|wanna|gotta|kinda|sorta|lemme|dunno|ya|nah|tho|fr|btw|imo|idk|omg)\b"
+HEDGING_WORDS = r"\b(maybe|not sure|kinda|sort of|might|possibly|perhaps|seems|appears|suggests|i think|i guess|idk)\b"
+EMOJI_PATTERN = r"[😀-🙏💪😎😉😂🤣😭😍❤️✨⭐👍👎🤔🥳]" # Basic emoji range, can be expanded
+POSITIVE_WORDS = {"good", "great", "awesome", "thanks", "helpful", "like", "love", "nice", "cool", "perfect", "excellent", "amazing"}
+NEGATIVE_WORDS = {"bad", "terrible", "hate", "problem", "issue", "difficult", "not helpful", "sucks", "annoying", "frustrating"}
+
 # --- API Key & Gemini Client Setup ---
-# I need to configure the Gemini client using the API key.
-# I'm using Streamlit's secrets management for security.
 try:
-    # This tries to load the key from `.streamlit/secrets.toml`
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
     genai.configure(api_key=GOOGLE_API_KEY)
-    # You could add a silent success log here if needed for deployment checks
-    # print("Gemini API Key configured successfully.")
 except KeyError:
-    # This error means the secrets file exists, but the key isn't IN it.
     st.error("🚨 Oops! Your `GOOGLE_API_KEY` was not found in the Streamlit secrets. Please add it.")
-    st.stop() # Stop the app if the key is missing.
+    st.stop()
 except Exception as e:
-    # Catch any other unexpected errors during configuration.
     st.error(f"🚨 An error occurred while configuring the Gemini API: {e}")
     st.stop()
 
+# --- NEW: Style Detection & Prompt Generation Functions ---
+
+def detect_style_traits(user_input):
+    """
+    Analyzes user input using regex/simple heuristics and returns a dict of detected style traits.
+    This helps ground the LSM simulation.
+    """
+    lower_input = user_input.lower()
+    words = set(re.findall(r'\b\w+\b', lower_input)) # Get unique words
+
+    traits = {
+        "emoji": bool(re.search(EMOJI_PATTERN, user_input)),
+        "informal": bool(re.search(INFORMAL_WORDS, lower_input, re.IGNORECASE)),
+        "hedging": bool(re.search(HEDGING_WORDS, lower_input, re.IGNORECASE)),
+        "questioning": user_input.strip().endswith("?"),
+        "exclamatory": user_input.count("!") > 0,
+        "short": len(user_input.split()) <= 10, # Simple word count threshold
+        "positive_sentiment": bool(words.intersection(POSITIVE_WORDS)),
+        "negative_sentiment": bool(words.intersection(NEGATIVE_WORDS)),
+        "pronouns": {
+            "i": bool(re.search(r'\bi\b', lower_input)), # Use regex word boundary
+            "you": bool(re.search(r'\byou\b', lower_input)),
+            "we": bool(re.search(r'\bwe\b', lower_input))
+        }
+    }
+    # Avoid conflicting sentiment flags if both trigger (simple override)
+    if traits["positive_sentiment"] and traits["negative_sentiment"]:
+         traits["negative_sentiment"] = False # Let positive override for simplicity
+
+    return traits
+
+def generate_dynamic_prompt(base_prompt, style_profile):
+    """
+    Modifies the base system instruction with specific style adaptation cues
+    based on the detected user style traits.
+    """
+    style_cues = [] # Start with an empty list for adaptation instructions
+
+    # Generate cues based on detected traits
+    if style_profile.get("emoji"):
+        style_cues.append("Feel free to include relevant emojis (like 🤔, 👍, 🌱) occasionally to match the user's expressive style, but don't overdo it.")
+    if style_profile.get("informal"):
+        style_cues.append("Adopt a more informal, relaxed tone. You can use contractions (e.g., 'it's', 'don't') and common, friendly slang if appropriate (e.g., 'cool', 'awesome').")
+    if style_profile.get("hedging"):
+        style_cues.append("Mirror the user's uncertainty by using tentative language (e.g., 'might', 'could', 'maybe', 'perhaps it could be useful to...').")
+    if style_profile.get("short"):
+        style_cues.append("Keep your sentences relatively brief and to the point, similar to the user.")
+    if style_profile.get("questioning"):
+        style_cues.append("Since the user asked a question, ensure your response directly addresses it. You can ask a clarifying follow-up question if needed.")
+    if style_profile.get("exclamatory"):
+        style_cues.append("You can use an exclamation point for enthusiasm if it fits the context (e.g., 'That's a great idea!'), but use them sparingly.")
+    if style_profile.get("positive_sentiment"):
+        style_cues.append("Reflect the user's positive tone with encouraging and optimistic language.")
+    if style_profile.get("negative_sentiment"):
+        style_cues.append("Acknowledge any user frustration with empathy (e.g., 'I understand that can be frustrating...'), then gently guide towards a constructive suggestion.")
+
+    # Pronoun cueing (simple examples)
+    pronouns = style_profile.get("pronouns", {})
+    if pronouns.get("we"):
+        style_cues.append("Consider using inclusive language like 'we' or 'let's' when suggesting actions (e.g., 'Maybe we could explore...').")
+    elif pronouns.get("you"):
+        style_cues.append("Frame suggestions directly using 'you' (e.g., 'You could try...').")
+    elif pronouns.get("i"):
+        # Be cautious with 'I' for the bot unless expressing empathy
+        style_cues.append("Use empathetic phrasing like 'I understand...' or 'I hear you...' if appropriate.")
+
+    # Combine base prompt with cues if any were generated
+    if style_cues:
+        # Add a clear separator and list the cues
+        modified_prompt = base_prompt + "\n\nIMPORTANT Style Adaptation Instructions (apply subtly):\n- " + "\n- ".join(style_cues)
+    else:
+        # No specific cues detected, use the base adaptive prompt
+        modified_prompt = base_prompt
+
+    return modified_prompt
+
 # --- Core Functions ---
 
-def get_gemini_response(user_prompt, chat_history, is_adaptive, show_avatar):
+# MODIFIED function to accept style_profile and use dynamic prompt generation
+def get_gemini_response(user_prompt, chat_history, is_adaptive, show_avatar, style_profile=None):
     """
     Fetches a response from the configured Gemini model.
 
-    I engineered the system prompts here to simulate the different experimental
-    conditions (Static vs. Adaptive Linguistic Style).
+    Uses dynamic system prompts for the 'Adaptive LSM' condition based on
+    the detected style profile of the user's last message.
     """
-    # Determine the persona name based on the avatar condition
     persona_name = DEFAULT_BOT_NAME if show_avatar else NO_AVATAR_BOT_NAME
 
-    # Define the core instructions for the LLM based on the LSM condition
-    if is_adaptive:
-        system_instruction_text = f"""
-        You are {persona_name}, a friendly AI wellness assistant. Your tone should feel approachable, supportive, and informative.
+    # --- Define BASE System Prompts ---
+    # Base prompt for the adaptive condition (cues will be added dynamically)
+    base_adaptive_prompt = f"""
+    You are {persona_name}, a friendly AI wellness assistant. Your goal is to provide helpful, general health and wellness information (fitness, nutrition, sleep, stress management).
+    Your tone should feel approachable, supportive, and informative.
+    You need to adapt your response style based on the user's last message, following the specific instructions below.
+    Keep responses relevant to health and wellness. Do NOT provide medical advice or diagnoses.
+    Remember the disclaimer: you are not a medical professional. If asked for medical advice, politely decline and state your limitations.
+    """
+    # Fixed prompt for the static condition
+    static_prompt = f"""
+    You are {persona_name}, a friendly AI wellness assistant. Your goal is to provide helpful, general health and wellness information (fitness, nutrition, sleep, stress management).
+    Your communication style is CONSISTENTLY: Empathetic, clear, encouraging, and informative, using moderate sentence length (around 1-3 sentences per response). Use standard, proper language without slang or excessive informality. Avoid emojis.
+    Maintain this specific style REGARDLESS of the user's writing style. Do NOT try to mimic the user.
+    Keep responses relevant to health and wellness. Do NOT provide medical advice or diagnoses.
+    Remember the disclaimer: you are not a medical professional. If asked for medical advice, politely decline and state your limitations.
+    """
 
-        You MUST pay close attention to the USER's most recent message and adapt your response's *style* (not just content) based on that message.
+    # --- Determine Final System Instruction ---
+    if is_adaptive and style_profile:
+        # Generate the full prompt with dynamic style cues
+        system_instruction_text = generate_dynamic_prompt(base_adaptive_prompt, style_profile)
+    else:
+        # Use the fixed static prompt if not adaptive or no profile provided
+        system_instruction_text = static_prompt
 
-        Focus on these aspects:
-        1. **Pronouns**: Mirror the user's use of "I", "you", "we" when giving suggestions.
-        2. **Sentence Length**: If the user uses short and concise sentences, do the same. If they are more verbose, allow yourself to elaborate more.
-        3. **Formality**: Match tone — contractions and casual phrases for informal messages; polished language for formal messages.
-        4. **Emoji & Punctuation**: If the user uses emojis or expressive punctuation (e.g., "!!", "lol"), you may include similar elements appropriately.
-        5. **Hedging**: Match the user’s level of confidence. If they hedge (e.g., “maybe”, “not sure”), mirror that tone. If they’re direct, be direct.
-
-        Respond in a natural way, not robotic. Do NOT explain that you're matching their style — keep it subtle. Only respond with wellness-related advice.
-
-        Avoid medical advice or diagnosis. Remind the user you are not a medical professional if needed.
-        """
-    else: # Static Style Condition
-        system_instruction_text = f"""
-        You are {persona_name}. Your goal is to provide helpful, general health and wellness information (fitness, nutrition, sleep, stress management).
-        Your communication style is CONSISTENTLY: Empathetic, clear, encouraging, and informative, using moderate sentence length.
-        Maintain this specific style REGARDLESS of the user's writing style. Do NOT try to mimic the user.
-        Keep responses relevant to health and wellness. Do NOT provide medical advice or diagnoses.
-        Remember the disclaimer: you are not a medical professional.
-        """
-
-    # Format the chat history for the Gemini API.
-    # It expects a specific structure with 'role' and 'parts'.
+    # --- Format Chat History for API ---
     messages_for_api = []
     for message in chat_history:
         role = "model" if message["role"] == "assistant" else message["role"]
         messages_for_api.append({"role": role, "parts": [{"text": message["content"]}]})
+    messages_for_api.append({"role": "user", "parts": [{"text": user_prompt}]}) # Add latest user prompt
 
-    # Add the latest user prompt in the required format
-    messages_for_api.append({"role": "user", "parts": [{"text": user_prompt}]})
-
-    # Call the Gemini API
+    # --- Call the Gemini API ---
     try:
-        # Initialize the model with the appropriate system instruction
         model = genai.GenerativeModel(
             GEMINI_MODEL_NAME,
-            system_instruction=system_instruction_text
+            system_instruction=system_instruction_text # Use the determined prompt
         )
-        # Generate the response based on the formatted history + new prompt
         response = model.generate_content(messages_for_api)
 
-        # I need to handle cases where the API might block the response or return nothing.
         if not response.candidates or not response.candidates[0].content.parts:
              if response.prompt_feedback and response.prompt_feedback.block_reason:
-                 # Inform the user if the response was blocked for safety reasons
                  return f"Response blocked due to: {response.prompt_feedback.block_reason}. Let's try a different topic."
              else:
-                 # Generic fallback if no response content is found
                  return "Sorry, I couldn't generate a response for that. Could you rephrase or ask about something else?"
 
-        # If successful, return the generated text content
         return response.text
 
     except Exception as e:
-        # Log the detailed error to the console during development/debugging
         print(f"Gemini API Error Details: {type(e).__name__} - {e}")
-        # Provide a user-friendly error message in the chat interface
         return "Sorry, I encountered an error trying to respond. Please try again."
 
 
+# --- Welcome/Disclaimer Function --- (No changes needed inside, calls are updated later)
 def display_welcome_disclaimer(show_avatar_in_welcome):
-    """
-    Handles the multi-step welcome message and disclaimer presentation.
-    Uses session state to track the user's progress through the steps.
-    """
-    # Initialize disclaimer step in session state if it doesn't exist
+    """ Handles the multi-step welcome message and disclaimer presentation. """
     if 'disclaimer_step' not in st.session_state:
         st.session_state.disclaimer_step = 1
 
-    # Using columns here to potentially show the avatar next to the welcome text
-    col1, col2 = st.columns([0.8, 0.2], gap="medium") # Adjust ratio/gap as needed
+    col1, col2 = st.columns([0.8, 0.2], gap="medium")
 
     with col1:
         st.title("Welcome to HopDoc")
-
-        # Display content based on the current step
         if st.session_state.disclaimer_step == 1:
-            st.markdown(f"""
-            Hi there! I'm **Franko** – your friendly, fitness-focused frog! {'*(Avatar simulated)*' if not show_avatar_in_welcome else ''}
-
-            Over the next **{int(SESSION_TIMEOUT_SECONDS / 60)} minutes**, feel free to ask me any questions related to health and wellness – like fitness tips, nutrition, sleep, or managing stress. Try to keep our conversation on-topic and appropriate.
-            """)
-            # Advance to the next step when the button is clicked
+            st.markdown(f"""Hi there! I'm **Franko** – your friendly, fitness-focused frog! {'*(Avatar simulated)*' if not show_avatar_in_welcome else ''}\n\nOver the next **{int(SESSION_TIMEOUT_SECONDS / 60)} minutes**, feel free to ask me any questions related to health and wellness – like fitness tips, nutrition, sleep, or managing stress. Try to keep our conversation on-topic and appropriate.""")
             if st.button("Continue"):
                 st.session_state.disclaimer_step = 2
-                st.rerun() # Rerun immediately to show the next step
-
+                st.rerun()
         elif st.session_state.disclaimer_step == 2:
-            st.markdown("""
-            **⚠️ Just a heads up:**
-
-            I'm **not** a medical professional, and I **can't** provide medical advice, diagnoses, or emergency support. If you're experiencing a health crisis or need medical care, **please contact a healthcare provider or emergency services.**
-            """)
-            # Using a space in the button label to differentiate from the previous "Continue"
+            st.markdown("""**⚠️ Just a heads up:**\n\nI'm **not** a medical professional, and I **can't** provide medical advice, diagnoses, or emergency support. If you're experiencing a health crisis or need medical care, **please contact a healthcare provider or emergency services.**""")
             if st.button("Continue "):
                 st.session_state.disclaimer_step = 3
                 st.rerun()
-
         elif st.session_state.disclaimer_step == 3:
-            st.markdown("""
-            Not sure where to start? You could try asking:
-
-            *   🤔 *"How can I improve my sleep routine?"*
-            *   🧘 *"What are quick ways to reduce stress during the day?"*
-
-            Have fun, and let's leap into wellness together!
-            """)
-            # This button marks the end of the disclaimer and starts the chat
+            st.markdown("""Not sure where to start? You could try asking:\n\n*   🤔 *"How can I improve my sleep routine?"*\n*   🧘 *"What are quick ways to reduce stress during the day?"*\n\nHave fun, and let's leap into wellness together!""")
             if st.button("Let's Begin!"):
                 st.session_state.disclaimer_accepted = True
-                st.session_state.start_time = time.time() # Record the start time
-                st.session_state.messages = [] # Ensure chat history is clear
+                st.session_state.start_time = time.time()
+                st.session_state.messages = [] # Clear chat history
 
-                # Generate the initial greeting from the bot based on the starting condition
+                # --- Generate initial greeting ---
+                # For the initial greeting, we don't have user input yet, so no style profile.
+                # We'll use the base prompt appropriate for the starting condition.
                 initial_greeting = get_gemini_response(
-                    user_prompt="<User just started the chat>", # Placeholder to trigger a greeting
+                    user_prompt="<User just started the chat>", # Placeholder
                     chat_history=[],
                     is_adaptive=st.session_state.experiment_condition['lsm'],
-                    show_avatar=st.session_state.experiment_condition['avatar']
+                    show_avatar=st.session_state.experiment_condition['avatar'],
+                    style_profile=None # No profile for initial greeting
                 )
-                # Determine the small avatar icon to use for the initial message
                 small_avatar_icon = AVATAR_IMAGE_PATH if st.session_state.experiment_condition['avatar'] else None
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": initial_greeting,
-                    # Store the avatar used for this message, consistent with main chat loop
                     "small_avatar_used": small_avatar_icon
+                    # No style profile for the bot's initial message
                 })
-                st.rerun() # Rerun to start the main chat interface
+                st.rerun()
 
-    # Display the small avatar image in the second column during the welcome steps
     with col2:
         if show_avatar_in_welcome and st.session_state.disclaimer_step <= 3:
              try:
-                st.image(AVATAR_IMAGE_PATH, width=100) # Smaller avatar for welcome
+                st.image(AVATAR_IMAGE_PATH, width=100)
              except FileNotFoundError:
                  st.warning(f"Avatar image '{AVATAR_IMAGE_PATH}' not found.")
              except Exception as e:
                  st.error(f"Error loading welcome avatar: {e}")
 
 # --- Initialize Session State ---
-# I need to set up default values for variables that persist across user interactions.
-if 'messages' not in st.session_state:
-    # Stores the chat history (list of dicts)
-    st.session_state.messages = []
-if 'disclaimer_accepted' not in st.session_state:
-    # Tracks if the user has passed the initial disclaimer screens
-    st.session_state.disclaimer_accepted = False
-if 'experiment_condition' not in st.session_state:
-    # Stores the current experimental setup (avatar T/F, LSM T/F)
-    # I'll start with Avatar + Adaptive LSM as the default view.
-    st.session_state.experiment_condition = {'avatar': True, 'lsm': True}
-if 'start_time' not in st.session_state:
-    # Records when the user clicks "Let's Begin!" to track interaction time
-    st.session_state.start_time = None
+if 'messages' not in st.session_state: st.session_state.messages = []
+if 'disclaimer_accepted' not in st.session_state: st.session_state.disclaimer_accepted = False
+if 'experiment_condition' not in st.session_state: st.session_state.experiment_condition = {'avatar': True, 'lsm': True}
+if 'start_time' not in st.session_state: st.session_state.start_time = None
 
-# --- Sidebar: Experiment Controls (For Researcher) ---
-# This section allows me (the researcher) to easily switch conditions.
+# --- Sidebar: Experiment Controls ---
 st.sidebar.title("Experiment Setup")
 st.sidebar.write("*(Control Panel for Researcher)*")
+avatar_option = st.sidebar.radio("Avatar Presence:", ('Avatar Visible', 'No Avatar'), index=0 if st.session_state.experiment_condition['avatar'] else 1, key="avatar_radio")
+lsm_option = st.sidebar.radio("Linguistic Style:", ('Adaptive LSM (Simulated)', 'Static Style'), index=0 if st.session_state.experiment_condition['lsm'] else 1, key="lsm_radio")
 
-# Radio buttons to select the Avatar Presence condition
-avatar_option = st.sidebar.radio(
-    "Avatar Presence:",
-    ('Avatar Visible', 'No Avatar'),
-    # Set default based on session state
-    index=0 if st.session_state.experiment_condition['avatar'] else 1,
-    key="avatar_radio" # Added key for stability
-)
-# Radio buttons to select the Linguistic Style condition
-lsm_option = st.sidebar.radio(
-    "Linguistic Style:",
-    ('Adaptive LSM (Simulated)', 'Static Style'),
-    # Set default based on session state
-    index=0 if st.session_state.experiment_condition['lsm'] else 1,
-    key="lsm_radio" # Added key for stability
-)
+# --- NEW: Debug Mode Toggle ---
+debug_mode = st.sidebar.checkbox("🔍 Show Detected Style Traits (Pilot Mode)", value=False, key="debug_mode")
 
-# Determine current settings based on radio button selections
 show_avatar_setting = (avatar_option == 'Avatar Visible')
 use_adaptive_lsm_setting = (lsm_option == 'Adaptive LSM (Simulated)')
 
-# Update the session state ONLY if a condition has actually changed
-# This prevents unnecessary resets or reruns if the user just re-clicks the same option.
 if st.session_state.experiment_condition['avatar'] != show_avatar_setting or \
    st.session_state.experiment_condition['lsm'] != use_adaptive_lsm_setting:
     st.session_state.experiment_condition['avatar'] = show_avatar_setting
     st.session_state.experiment_condition['lsm'] = use_adaptive_lsm_setting
-    # NOTE: Changing condition mid-chat might be confusing for the user/data.
-    # For a real experiment, I'd likely assign conditions *before* the user starts
-    # and potentially disable these controls during the participant interaction.
-    # Consider uncommenting below if a reset is desired on condition change:
-    # st.session_state.messages = []
-    # st.session_state.start_time = None # Reset timer too?
-    # st.rerun()
+    # Consider resetting chat/timer if conditions change mid-interaction during testing
 
-# Display the currently active condition for confirmation
 st.sidebar.markdown("---")
 st.sidebar.write(f"**Current Condition:**")
 st.sidebar.write(f"- Avatar: {'Yes' if st.session_state.experiment_condition['avatar'] else 'No'}")
 st.sidebar.write(f"- Style: {'Adaptive (Simulated)' if st.session_state.experiment_condition['lsm'] else 'Static'}")
 
-
 # --- Main App Interface ---
-
-# Show disclaimer first, then the chat interface
 if not st.session_state.disclaimer_accepted:
-    # Pass the current avatar setting to the disclaimer display function
     display_welcome_disclaimer(show_avatar_in_welcome=st.session_state.experiment_condition['avatar'])
 else:
-    # --- Chat Interface ---
     st.title("Chat with HopDoc")
-
-    # Calculate and display the interaction timer
     time_limit_reached = False
     if st.session_state.start_time:
         elapsed_time = time.time() - st.session_state.start_time
@@ -282,77 +281,81 @@ else:
         timer_display = f"Time elapsed: {int(minutes):02}:{int(seconds):02} / {int(SESSION_TIMEOUT_SECONDS / 60):02}:00"
         time_limit_reached = elapsed_time > SESSION_TIMEOUT_SECONDS
     else:
-        # Should ideally not happen if disclaimer_accepted is True, but safer
         timer_display = "Timer not started."
 
-    # Define the main layout with columns for the avatar and the chat
-    avatar_col, chat_col = st.columns([0.3, 0.7], gap="large") # Adjust ratio as needed
+    avatar_col, chat_col = st.columns([0.3, 0.7], gap="large")
 
-    # --- Avatar Column ---
-    with avatar_col:
-        # Display the large Franko avatar if the condition is active
+    with avatar_col: # Avatar column
         if st.session_state.experiment_condition['avatar']:
-            try:
-                st.image(AVATAR_IMAGE_PATH, use_container_width=True)
-            except FileNotFoundError:
-                st.warning(f"Large avatar image '{AVATAR_IMAGE_PATH}' not found.")
-            except Exception as e:
-                st.error(f"Error loading large avatar: {e}")
-        else:
-            # Keep the column structure even if empty
-            st.write("")
+            try: st.image(AVATAR_IMAGE_PATH, use_container_width=True)
+            except FileNotFoundError: st.warning(f"Large avatar image '{AVATAR_IMAGE_PATH}' not found.")
+            except Exception as e: st.error(f"Error loading large avatar: {e}")
+        else: st.write("")
 
-    # --- Chat Column ---
-    with chat_col:
-        # Display the timer within the chat column
+    with chat_col: # Chat column
         st.caption(timer_display)
         if time_limit_reached:
             st.warning("Interaction time limit reached. Please complete the survey.")
 
-        # Determine the small icon to use next to assistant messages
-        # I decided *not* to show the small icon if the large avatar is present,
-        # but uncomment the first line if you prefer to show both.
-        # use_small_avatar_icon = AVATAR_IMAGE_PATH if st.session_state.experiment_condition['avatar'] else None
-        use_small_avatar_icon = None # Set to None if large avatar is primary visual
+        use_small_avatar_icon = None # Not using small icon if large avatar present
 
-        # Display existing chat messages from history
+        # Display chat history
         for message in st.session_state.messages:
-            # Use the 'small_avatar_used' key stored with the message for consistency
             with st.chat_message(message["role"], avatar=message.get("small_avatar_used")):
                 st.markdown(message["content"])
+                # --- NEW: Optionally display stored style profile in debug mode ---
+                if debug_mode and message["role"] == "user" and "style_profile" in message:
+                    st.caption("Detected Style:")
+                    st.json(message["style_profile"], expanded=False)
 
-        # Get user input using the chat input widget
-        # Disable input if the time limit has been reached
+
+        # Handle user input
         if prompt := st.chat_input("What health questions do you have?", disabled=time_limit_reached, key="chat_input"):
 
-            # 1. Display and store the user's message
+            # --- Detect user style FIRST ---
+            user_style_profile = detect_style_traits(prompt)
+
+            # 1. Display and store user message (including style profile)
             with st.chat_message("user"):
                 st.markdown(prompt)
+                # Display detected traits under user message if debug mode is on
+                if debug_mode:
+                    st.caption("Detected Style:")
+                    st.json(user_style_profile, expanded=False)
+
             st.session_state.messages.append({
                 "role": "user",
                 "content": prompt,
-                "small_avatar_used": None # User messages don't have an avatar icon
-                })
+                "small_avatar_used": None,
+                "style_profile": user_style_profile # Store detected profile
+            })
 
-            # 2. Generate and display the assistant's response
+            # --- Display detected traits in sidebar if debug mode is on ---
+            if debug_mode:
+                 st.sidebar.markdown("---")
+                 st.sidebar.markdown("### 🧠 Last User Style Detected")
+                 st.sidebar.json(user_style_profile)
+
+
+            # 2. Generate and display assistant response
             with st.chat_message("assistant", avatar=use_small_avatar_icon):
-                # Show a thinking indicator while waiting for the API
                 with st.spinner("Thinking..."):
+                    # --- Pass detected style profile to the LLM function ---
                     response = get_gemini_response(
-                        prompt,
-                        st.session_state.messages, # Pass full history
+                        prompt=prompt, # Pass current prompt for context if needed by function logic
+                        chat_history=st.session_state.messages[:-1], # Pass history *before* this user turn
                         is_adaptive=st.session_state.experiment_condition['lsm'],
-                        show_avatar=st.session_state.experiment_condition['avatar']
+                        show_avatar=st.session_state.experiment_condition['avatar'],
+                        style_profile=user_style_profile # Pass the detected profile
                     )
                     st.markdown(response)
 
-            # 3. Store the assistant's response
+            # 3. Store assistant response
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": response,
-                "small_avatar_used": use_small_avatar_icon # Store the icon used
-                })
+                "small_avatar_used": use_small_avatar_icon
+                # Could add bot style profile here later if needed
+            })
 
-            # Rerun the script immediately after processing input/output.
-            # This ensures the new messages are displayed correctly and the input box is ready.
-            st.rerun()
+            st.rerun() # Rerun for immediate UI update
