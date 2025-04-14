@@ -342,7 +342,7 @@ else:
                 with st.spinner("Thinking..."):
                     # --- Pass detected style profile to the LLM function ---
                     response = get_gemini_response(
-                        prompt=prompt, # Pass current prompt for context if needed by function logic
+                        prompt, # Pass current prompt for context if needed by function logic
                         chat_history=st.session_state.messages[:-1], # Pass history *before* this user turn
                         is_adaptive=st.session_state.experiment_condition['lsm'],
                         show_avatar=st.session_state.experiment_condition['avatar'],
