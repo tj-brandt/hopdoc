@@ -1,0 +1,20 @@
+# .gitignore
+
+# Secrets
+.streamlit/secrets.toml
+
+# Virtual Environment
+venv/
+*/venv/
+.venv/
+*/.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS generated files
+.DS_Store
+Thumbs.db

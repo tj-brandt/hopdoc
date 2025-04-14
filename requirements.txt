@@ -1,0 +1,3 @@
+# requirements.txt
+streamlit==1.44.1
+google_genai==-1.10.0
