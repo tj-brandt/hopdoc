@@ -1,6 +1,8 @@
 # requirements.txt
 streamlit==1.44.1
 google-generativeai
-ntlk
-functools
 emoji
+nltk
+pandas
+textstat
+empath
