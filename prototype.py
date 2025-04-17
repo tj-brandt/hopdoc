@@ -5,357 +5,998 @@ This app simulates a health chatbot (HopDoc) with different conditions
 to test user perceptions based on avatar presence and linguistic style matching (LSM).
 It uses the Google Gemini API for generating responses and includes an enhanced
 LSM simulation based on detected user style traits.
+
+Major Changes:
+- Added Participant ID input screen.
+- Implemented comprehensive JSONL logging for experiment data.
+- Added session timeout logic.
+- Switched tokenization to NLTK's word_tokenize for potentially better handling.
+- Refined post-processing to remove double spaces.
+- Removed unused imports.
 """
 
-import streamlit as st
-import time
-import random
-import google.generativeai as genai
 import os
-import re # Needed for regex-based style detection
+import re
+import time
+import json
+from datetime import datetime, timezone
+import streamlit as st
+import emoji
+import functools
+import google.generativeai as genai
+import nltk
+import textstat
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from empath import Empath
+from nltk.tokenize import word_tokenize
 
-# --- Page Configuration (Must be the first Streamlit command!) ---
+# --- Streamlit Page Configuration ---
 st.set_page_config(layout="wide")
 
-# --- Global Configuration & Constants ---
-AVATAR_IMAGE_PATH = "franko.png"
+# Initialize Empath lexicon
+lexicon = Empath()
+
+# --- NLTK / VADER Setup ---
+NLTK_DIR = os.path.join(os.path.expanduser("~"), "nltk_data")
+if not os.path.exists(NLTK_DIR):
+    os.makedirs(NLTK_DIR)
+nltk.data.path.append(NLTK_DIR)
+
+# Function to download NLTK data safely
+def download_nltk_data():
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        st.info("Downloading NLTK 'punkt' tokenizer data...")
+        nltk.download('punkt', download_dir=NLTK_DIR)
+        st.success("NLTK 'punkt' downloaded.")
+
+    try:
+        nltk.data.find('sentiment/vader_lexicon.zip/vader_lexicon/vader_lexicon.txt')
+    except LookupError:
+        st.info("Downloading NLTK 'vader_lexicon' data...")
+        nltk.download('vader_lexicon', download_dir=NLTK_DIR)
+        st.success("NLTK 'vader_lexicon' downloaded.")
+
+download_nltk_data()
+sia = SentimentIntensityAnalyzer()
+
+# --- Logging Setup ---
+LOG_DIR = "experiment_logs"
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
+def log_event(event_data):
+    """Logs an event dictionary to a participant-specific JSONL file."""
+    if 'participant_id' not in st.session_state or not st.session_state.participant_id:
+        print("Warning: Attempted to log event without participant ID.")
+        return # Don't log if participant ID isn't set
+
+    log_file = st.session_state.get("log_file_path")
+    if not log_file:
+        print("Error: Log file path not set in session state.")
+        return
+
+    try:
+        # Add timestamp and participant ID to every log entry
+        event_data["timestamp_utc"] = datetime.now(timezone.utc).isoformat()
+        event_data["participant_id"] = st.session_state.participant_id
+        event_data["session_id"] = st.session_state.session_id # Unique ID for this specific run
+
+        with open(log_file, 'a', encoding='utf-8') as f:
+            json.dump(event_data, f, ensure_ascii=False)
+            f.write('\n')
+    except Exception as e:
+        st.error(f"Logging Error: Failed to write to log file {log_file}. Error: {e}")
+        print(f"Logging Error: Failed to write event {event_data} to {log_file}. Error: {e}")
+
+
+# --- Pre-compile regex patterns & define function words ---
+INFORMAL_RE = re.compile(
+    # Original + Previous additions:
+    r"\b(sup|bruh|yo|dude|frank[iy]+|lol|lmao|deadass|ain't|gonna|wanna|gotta|"
+    r"kinda|sorta|lemme|dunno|ya|nah|tho|fr|btw|imo|idk|omg|ur|"
+    r"u|yea+h*|funn+y+|ben|gotta|here+|playa|"
+    # Acronyms:
+    r"smh|tbh|omfg|wtf|idc|fyi|jk|btw|rn|lmk|"
+    # Leet/Numbers:
+    r"gr[38]t|l8r|b4|sk8|h8)\b|" # Added common leet speak
+    # Laughter:
+    r"\b(ha){2,}\b|\b(he){2,}\b|\b(hi){2,}\b|"
+    # Elongated Vowels (Keep, but test):
+    r"\b\w*([aeiou])\1{2,}\w*\b|"
+    # Repeated Punctuation (end of string or followed by space):
+    r"[!?\.]{2,}(\s|$)|" # Match two or more !, ?, .
+    # Basic Emoticons / Kaomoji (add more if needed):
+    r":\-?p\b|:\-?3\b|;\-?p\b|:\-?d\b|<3|:\'\((?!\w)|¯\\_\(ツ\)_/¯", # Added :'( , shrug
+    re.IGNORECASE | re.UNICODE # Add UNICODE flag for shrug etc.
+)
+HEDGING_RE = re.compile(
+    r"\b(maybe|not sure|kinda|sort of|might|possibly|perhaps|seems|appears|"
+    r"suggests|i think|i guess|idk)\b",
+    re.IGNORECASE
+)
+# Add new categories
+# Note: This is a basic list, can be expanded. Be mindful of overlaps if any.
+AUX_VERBS = {"am", "is", "are", "was", "were", "be", "being", "been",
+             "have", "has", "had", "having",
+             "do", "does", "did",
+             "will", "would", "shall", "should", "may", "might", "must", "can", "could"}
+
+CONJUNCTIONS = {"and", "but", "or", "so", "yet", "for", "nor", # Coordinating
+                "while", "whereas", "although", "though", "because", "since", "if", "unless", "until", "when", "as", "that", "whether", "after", "before"} # Subordinating (common ones)
+
+NEGATIONS = {"no", "not", "never", "none", "nobody", "nothing", "nowhere", "neither", "nor", "ain't", "don't", "isn't", "wasn't", "weren't", "haven't", "hasn't", "hadn't", "didn't", "won't", "wouldn't", "shan't", "shouldn't", "mightn't", "mustn't", "can't", "couldn't"}
+# Note: NLTK tokenization splits contractions like "don't" -> "do", "n't". Need to adjust tokenization or list.
+# Let's adjust tokenization to keep contractions for negation matching.
+
+FUNCTION_WORDS = {
+    "i","you","we","he","she","they","me","him","her","us","them",
+    "a","an","the",
+    "in","on","at","by","for","with","about","against","between",
+    "into","through","during","before","after","above","below","to",
+    "from","up","down","over","under"
+} | AUX_VERBS | CONJUNCTIONS | NEGATIONS # Combine all for general function word ratio
+
+
+# Updated LSM_CATEGORIES dictionary
+LSM_CATEGORIES = {
+    "pronouns": {"i","you","we","he","she","they","me","him","her","us","them"},
+    "articles":  {"a","an","the"},
+    "prepositions": {
+        "in","on","at","by","for","with","about","against","between",
+        "into","through","during","before","after","above","below",
+        "to","from","up","down","over","under"
+    },
+    "aux_verbs": AUX_VERBS,
+    "conjunctions": CONJUNCTIONS,
+    "negations": NEGATIONS,
+    # Add quantifiers if desired later
+}
+
+# --- Helper Functions (Updated Tokenization for Negations/LSM Counts) ---
+# Define the pattern for valid tokens including n't
+valid_token_pattern = re.compile(r"^[a-z0-9]+$|^n't$", re.IGNORECASE)
+
+def tokenize_text(text: str) -> list[str]:
+    """
+    Tokenizes text using NLTK, preserving contractions (like n't) via regex filter,
+    and returns lowercase tokens.
+    """
+    try:
+        tokens = word_tokenize(text.lower())
+        # Use the regex pattern to filter tokens
+        return [t for t in tokens if valid_token_pattern.match(t)]
+    except Exception as e:
+        print(f"Tokenization error: {e}. Falling back to simple split.")
+        # Fallback regex updated to try and capture n't
+        return re.findall(r"\w+|n't", text.lower())
+
+# Updated get_category_fraction to be simpler with correct tokenization
+def get_category_fraction(text: str, word_set: set) -> float:
+    tokens = tokenize_text(text) # Correct tokenization now keeps/removes as needed
+    if not tokens:
+        return 0.0
+    # Now that tokenization is correct, simple check is enough
+    count = sum(1 for t in tokens if t in word_set)
+    return count / len(tokens)
+
+# Also update detect_style_traits to use the corrected count logic if needed for LSM counts:
+# compute_lsm_score remains structurally the same, but will now iterate over more categories
+def compute_lsm_score(user_text: str, bot_text: str) -> float:
+    scores = []
+    for cat_words in LSM_CATEGORIES.values(): # Iterates over all categories now
+        fu = get_category_fraction(user_text, cat_words)
+        fb = get_category_fraction(bot_text,  cat_words)
+        denom = fu + fb
+        if denom > 1e-6:
+             scores.append(1 - abs(fu - fb) / denom)
+        elif abs(fu - fb) < 1e-6:
+             scores.append(1.0)
+        else:
+             scores.append(0.0)
+
+    return sum(scores) / len(scores) if scores else 1.0
+
+
+# FINAL RECOMMENDED VERSION for post_process_response
+def post_process_response(resp: str, is_adaptive: bool) -> str:
+    """Cleans up bot response, removing informality/emojis for static style,
+       and fixing common markdown list formatting (ensuring newline before items)."""
+    if not is_adaptive:
+        # Use emoji library to remove emojis
+        resp = emoji.replace_emoji(resp, replace="")
+        # Replace informal words with empty string
+        resp = re.sub(INFORMAL_RE, "", resp) # Use updated INFORMAL_RE
+
+    # Remove extra whitespace first
+    resp = re.sub(r'\s{2,}', ' ', resp).strip()
+
+    # --- Add Markdown List Fix ---
+    # Ensure newline BEFORE list items (* or -) if not already there.
+    # Looks for char NOT a newline, followed by optional newline,
+    # then optional space, then bullet (* or -), then required space.
+    # Replaces with the found char + \n + the space/bullet/space part.
+    resp = re.sub(r"([^\n])(\n?)(\s*[\*-]\s+)", r"\1\n\3", resp)
+
+    # Also handle case where list starts at the very beginning of the response
+    resp = re.sub(r"^(\s*[\*-]\s+)", r"\n\1", resp)
+
+
+    # Remove extra spaces potentially introduced AFTER the bullet fix
+    resp = re.sub(r'\s{2,}', ' ', resp).strip()
+    # Collapse >2 consecutive newlines into max 2 (for paragraph spacing)
+    resp = re.sub(r'\n{3,}', '\n\n', resp)
+
+    return resp
+
+
+# --- Global Constants ---
+AVATAR_IMAGE_PATH = "franko.png" # Make sure this file exists
 DEFAULT_BOT_NAME = "HopDoc (Franko)"
 NO_AVATAR_BOT_NAME = "HopDoc"
-# Using the specific experimental model I selected.
-GEMINI_MODEL_NAME = "gemini-2.0-flash-thinking-exp-01-21"
-SESSION_TIMEOUT_SECONDS = 600 # 10 minutes for the interaction
+GEMINI_MODEL_NAME = "gemini-2.0-flash-thinking-exp-01-21" # Use a standard model name unless specific version is required
+SESSION_TIMEOUT_SECONDS = 600  # 10 minutes
+LOG_SESSION_EVENTS = True # Control logging easily
+MIN_LSM_TOKENS = 15 # Minimum tokens for user AND bot response to update smoothed LSM
+LSM_SMOOTHING_ALPHA = 0.4 # Smoothing factor (0 = ignore new, 1 = use only new)
 
-# --- Lists for Style Detection ---
-INFORMAL_WORDS = r"\b(bruh|yo|dude|lol|lmao|deadass|ain't|gonna|wanna|gotta|kinda|sorta|lemme|dunno|ya|nah|tho|fr|btw|imo|idk|omg)\b"
-HEDGING_WORDS = r"\b(maybe|not sure|kinda|sort of|might|possibly|perhaps|seems|appears|suggests|i think|i guess|idk)\b"
-EMOJI_PATTERN = r"[😀-🙏💪😎😉😂🤣😭😍❤️✨⭐👍👎🤔🥳]" # Basic emoji range, can be expanded
-POSITIVE_WORDS = {"good", "great", "awesome", "thanks", "helpful", "like", "love", "nice", "cool", "perfect", "excellent", "amazing"}
-NEGATIVE_WORDS = {"bad", "terrible", "hate", "problem", "issue", "difficult", "not helpful", "sucks", "annoying", "frustrating"}
+# --- Style Detection Function ---
+# def is_informal_token(tok): # Define if using frequency heuristic
+#     # Very rare words (zipf < 2.5) or OOV that aren't likely proper nouns/numbers
+#     # Basic check: ignore capitalized words and pure numbers for this heuristic
+#     if not tok.istitle() and not tok.isdigit():
+#          # Check if not in standard dictionary AND rare
+#          if tok not in EN_WORDS and zipf_frequency(tok, "en") < 2.5:
+#              return True
+#     return False
 
-# --- API Key & Gemini Client Setup ---
-try:
-    GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-    genai.configure(api_key=GOOGLE_API_KEY)
-except KeyError:
-    st.error("🚨 Oops! Your `GOOGLE_API_KEY` was not found in the Streamlit secrets. Please add it.")
-    st.stop()
-except Exception as e:
-    st.error(f"🚨 An error occurred while configuring the Gemini API: {e}")
-    st.stop()
-
-# --- NEW: Style Detection & Prompt Generation Functions ---
-
-def detect_style_traits(user_input):
-    """
-    Analyzes user input using regex/simple heuristics and returns a dict of detected style traits.
-    This helps ground the LSM simulation.
-    """
+def detect_style_traits(user_input: str) -> dict:
     lower_input = user_input.lower()
-    words = set(re.findall(r'\b\w+\b', lower_input)) # Get unique words
+    tokens = tokenize_text(user_input)
+    word_count = len(tokens)
+
+    # Calculate informality based on regex AND potentially other methods
+    regex_informal = bool(INFORMAL_RE.search(user_input)) # Search raw input for punctuation/emojis
+    # heuristic_informal = any(is_informal_token(t) for t in tokens) # Uncomment if using frequency heuristic
+    # slangnet_informal = any(t in slangnet_set for t in tokens) # Uncomment if using SlangNet
+
+    # Combine flags (adjust logic as needed)
+    is_informal = regex_informal # or heuristic_informal or slangnet_informal
 
     traits = {
-        "emoji": bool(re.search(EMOJI_PATTERN, user_input)),
-        "informal": bool(re.search(INFORMAL_WORDS, lower_input, re.IGNORECASE)),
-        "hedging": bool(re.search(HEDGING_WORDS, lower_input, re.IGNORECASE)),
+        "emoji": emoji.emoji_count(user_input) > 0,
+        "informal": is_informal, # Use combined flag
+        "hedging": bool(HEDGING_RE.search(lower_input)),
         "questioning": user_input.strip().endswith("?"),
         "exclamatory": user_input.count("!") > 0,
-        "short": len(user_input.split()) <= 10, # Simple word count threshold
-        "positive_sentiment": bool(words.intersection(POSITIVE_WORDS)),
-        "negative_sentiment": bool(words.intersection(NEGATIVE_WORDS)),
-        "pronouns": {
-            "i": bool(re.search(r'\bi\b', lower_input)), # Use regex word boundary
-            "you": bool(re.search(r'\byou\b', lower_input)),
-            "we": bool(re.search(r'\bwe\b', lower_input))
-        }
+        "short": word_count <= 10,
+        "question_count": user_input.count("?"),
+        "exclamation_count": user_input.count("!"),
     }
-    # Avoid conflicting sentiment flags if both trigger (simple override)
-    if traits["positive_sentiment"] and traits["negative_sentiment"]:
-         traits["negative_sentiment"] = False # Let positive override for simplicity
+
+    # --- Explicit Request Detection ---
+    meta_request = None
+    if re.search(r"\b(short|shorter|concise|brief|less text|too long)\b", lower_input):
+        meta_request = "shorter"
+    # Updated regex for 'longer' requests
+    elif re.search(r"\b(more detail|long|longer|lengthy|elaborate)\b", lower_input):
+        meta_request = "longer"
+    elif re.search(r"\b(simple|simpler|easy|easier)\b", lower_input):
+         meta_request = "simpler"
+    traits["meta_request"] = meta_request
+
+    # --- Sentiment Analysis (Adjust threshold later in prompt generation) ---
+    sentiment = sia.polarity_scores(user_input)
+    traits.update({
+        "sentiment_neg": sentiment["neg"],
+        "sentiment_neu": sentiment["neu"],
+        "sentiment_pos": sentiment["pos"],
+        "sentiment_compound": sentiment["compound"],
+    })
+
+    # --- Sentence splitting and complexity ---
+    sentences = [s.strip() for s in re.split(r"[.!?]+", user_input) if s.strip()]
+    sentence_count = max(1, len(sentences))
+    avg_sentence_length = word_count / sentence_count # Uses token count
+
+    # Avg word length calculation (less critical now, but uses filtered tokens)
+    avg_word_length = sum(len(w) for w in tokens) / max(1, word_count)
+
+    try:
+        flesch_ease = textstat.flesch_reading_ease(user_input)
+        fk_grade = textstat.flesch_kincaid_grade(user_input)
+    except Exception as e:
+        print(f"Textstat error: {e}")
+        flesch_ease = -1
+        fk_grade = -1
+
+    # --- Function Word Ratio (based on combined FUNCTION_WORDS set) ---
+    func_count = sum(1 for w in tokens if w in FUNCTION_WORDS) # Uses updated set
+    function_word_ratio = func_count / max(1, word_count)
+
+    traits.update({
+        "avg_sentence_length":   avg_sentence_length,
+        "avg_word_length":       avg_word_length, # Less reliable with this tokenization
+        "flesch_reading_ease":   flesch_ease,
+        "fk_grade":              fk_grade,
+        "function_word_ratio":   function_word_ratio,
+    })
+
+    # --- Empath Analysis ---
+    try:
+        empath_cats = lexicon.analyze(user_input, normalize=True)
+        if empath_cats is None: empath_cats = {}
+    except Exception as e:
+        print(f"Empath analysis error: {e}")
+        empath_cats = {}
+
+    traits.update({
+        "empath_social":    empath_cats.get("social", 0.0),
+        "empath_cognitive": empath_cats.get("cognitive_processes", 0.0),
+        "empath_affect":    empath_cats.get("affect", 0.0),
+    })
+
+    # --- LSM Category Counts ---
+    lsm_counts = {}
+    tokens_for_lsm = tokenize_text(lower_input) # Tokenize once for all counts
+    if tokens_for_lsm: # Avoid division by zero if tokenization fails
+        for cat_name, cat_words in LSM_CATEGORIES.items():
+            is_negation_set = "not" in cat_words
+            count = 0
+            for t in tokens_for_lsm:
+                if t in cat_words:
+                    count += 1
+                elif is_negation_set and t == "n't" and any(neg.endswith("n't") for neg in cat_words):
+                    count += 1
+            lsm_counts[cat_name] = count
+    else:
+        lsm_counts = {cat_name: 0 for cat_name in LSM_CATEGORIES} # Default to zero counts
+
+    traits["lsm_counts"] = lsm_counts
+
+    # --- Pronoun specific flags (still useful for direct 'I'/'we' cues) ---
+    traits["pronouns"] = {
+        "i":   bool(re.search(r"\bi\b", lower_input)),
+        "you": bool(re.search(r"\byou\b", lower_input)),
+        "we":  bool(re.search(r"\bwe\b", lower_input)),
+    }
 
     return traits
 
-def generate_dynamic_prompt(base_prompt, style_profile):
-    """
-    Modifies the base system instruction with specific style adaptation cues
-    based on the detected user style traits.
-    """
-    style_cues = [] # Start with an empty list for adaptation instructions
 
-    # Generate cues based on detected traits
+# --- Dynamic Prompt Generation (Updated Cues) ---
+def generate_dynamic_prompt(base_prompt: str, style_profile: dict) -> str:
+    style_cues = []
+
+    # --- High Priority: Explicit User Requests ---
+    meta_request = style_profile.get("meta_request")
+    if meta_request:
+        if meta_request == "shorter":
+            style_cues.append("**USER REQUEST**: Respond concisely (e.g., 1-3 short sentences or bullet points). Acknowledge if you were too verbose previously.")
+        elif meta_request == "longer":
+            style_cues.append("**USER REQUEST**: Provide more detail or elaborate further.")
+        elif meta_request == "simpler":
+             style_cues.append("**USER REQUEST**: Explain in simpler terms, using easier vocabulary.")
+
+    # --- Linguistic Style Matching (LSM) Cues ---
+    lsm_prev = style_profile.get("lsm_score_prev", None)
+    lsm_counts = style_profile.get("lsm_counts", {})
+    lsm_info_parts = []
+    if lsm_prev is not None:
+        lsm_info_parts.append(f"Previous LSM score: {lsm_prev:.2f}")
+
+    pron_c = lsm_counts.get('pronouns', 0)
+    art_c = lsm_counts.get('articles', 0)
+    prep_c = lsm_counts.get('prepositions', 0)
+    aux_c = lsm_counts.get('aux_verbs', 0)
+    conj_c = lsm_counts.get('conjunctions', 0)
+    neg_c = lsm_counts.get('negations', 0)
+
+    lsm_info_parts.append(f"User counts: {pron_c}pn, {art_c}art, {prep_c}prep, {aux_c}aux, {conj_c}conj, {neg_c}neg.")
+
+    if lsm_info_parts:
+         style_cues.append(f"LSM Info: {' '.join(lsm_info_parts)} Consider aligning your function word density.")
+         if lsm_prev is not None:
+             if lsm_prev < 0.4:
+                 style_cues.append("-> Style differs significantly, try matching user function word counts more closely.")
+             elif lsm_prev < 0.7:
+                 style_cues.append("-> Moderate alignment, maintain or slightly adjust function word usage.")
+
+
+    # --- Sentiment Cues (Adjusted Threshold) ---
+    comp = style_profile.get("sentiment_compound", 0)
+    # Lowered negative threshold, slightly increased positive threshold
+    if comp >= 0.6:
+        style_cues.append("User tone seems positive. Respond with an upbeat, encouraging style.")
+    elif comp <= -0.2: # Lowered threshold
+        style_cues.append("User tone seems negative/frustrated. Respond with extra empathy and clarity.")
+
+    # --- Length & Complexity Cues ---
+    asl = style_profile.get("avg_sentence_length", 15)
+    # Providing target length might be more effective
+    style_cues.append(f"User avg sentence length: {asl:.1f} words. Aim for similar brevity/detail in your sentences.")
+    # Example of conditional cue (less direct):
+    # if asl > 20:
+    #     style_cues.append("User messages are detailed (long sentences). Respond informatively but try to be reasonably concise unless asked for detail.")
+    # elif asl < 8:
+    #     style_cues.append("User messages are brief (short sentences). Keep your responses concise and to the point.")
+
+    fre = style_profile.get("flesch_reading_ease", 100)
+    if fre < 60: # Harder to read
+        style_cues.append(f"User language complexity (FRE {fre:.0f}) suggests simpler wording may be better. Use clear, accessible language (aim for FRE > 60).")
+
+    # --- Punctuation Cues ---
+    q_count = style_profile.get("question_count", 0)
+    e_count = style_profile.get("exclamation_count", 0)
+    if style_profile.get("questioning"): # Check the boolean flag still
+         style_cues.append(f"User asked a question ({q_count} '?'). Ensure you address it directly. Ask for clarification if ambiguous.")
+    if e_count > 0:
+        style_cues.append(f"User used {e_count} '!'. Use exclamation points very sparingly yourself for matching enthusiasm if appropriate.")
+
+
+    # --- Other Style Cues (Informality, Hedging, Pronouns, Empath) ---
     if style_profile.get("emoji"):
-        style_cues.append("Feel free to include relevant emojis (like 🤔, 👍, 🌱) occasionally to match the user's expressive style, but don't overdo it.")
+        style_cues.append("User uses emojis. Include 1-2 relevant emojis if appropriate.")
     if style_profile.get("informal"):
-        style_cues.append("Adopt a more informal, relaxed tone. You can use contractions (e.g., 'it's', 'don't') and common, friendly slang if appropriate (e.g., 'cool', 'awesome').")
+        style_cues.append("User uses informal language/slang (e.g., 'u', 'lol', 'yeaah'). Adopt a slightly more relaxed, conversational tone. Avoid being stiffly formal.")
     if style_profile.get("hedging"):
-        style_cues.append("Mirror the user's uncertainty by using tentative language (e.g., 'might', 'could', 'maybe', 'perhaps it could be useful to...').")
-    if style_profile.get("short"):
-        style_cues.append("Keep your sentences relatively brief and to the point, similar to the user.")
-    if style_profile.get("questioning"):
-        style_cues.append("Since the user asked a question, ensure your response directly addresses it. You can ask a clarifying follow-up question if needed.")
-    if style_profile.get("exclamatory"):
-        style_cues.append("You can use an exclamation point for enthusiasm if it fits the context (e.g., 'That's a great idea!'), but use them sparingly.")
-    if style_profile.get("positive_sentiment"):
-        style_cues.append("Reflect the user's positive tone with encouraging and optimistic language.")
-    if style_profile.get("negative_sentiment"):
-        style_cues.append("Acknowledge any user frustration with empathy (e.g., 'I understand that can be frustrating...'), then gently guide towards a constructive suggestion.")
+        style_cues.append("User uses hedging/tentative language (e.g., 'maybe', 'I think'). Mirror this slightly with cautious phrasing where appropriate (e.g., 'It might be...', 'Some find...').")
 
-    # Pronoun cueing (simple examples)
     pronouns = style_profile.get("pronouns", {})
     if pronouns.get("we"):
-        style_cues.append("Consider using inclusive language like 'we' or 'let's' when suggesting actions (e.g., 'Maybe we could explore...').")
+        style_cues.append("User uses 'we'. Frame suggestions collaboratively using 'we' sometimes.")
     elif pronouns.get("you"):
-        style_cues.append("Frame suggestions directly using 'you' (e.g., 'You could try...').")
+        style_cues.append("User uses 'you'. Frame advice directly using 'you'.")
     elif pronouns.get("i"):
-        # Be cautious with 'I' for the bot unless expressing empathy
-        style_cues.append("Use empathetic phrasing like 'I understand...' or 'I hear you...' if appropriate.")
+        # Make this more specific if 'I' count is high?
+        style_cues.append("User uses 'I'. Use empathetic 'I' statements where appropriate (e.g., 'I understand...').")
 
-    # Combine base prompt with cues if any were generated
+
+    cat_scores = {
+        "social": style_profile.get("empath_social", 0),
+        "cognitive": style_profile.get("empath_cognitive", 0),
+        "affect": style_profile.get("empath_affect", 0)
+    }
+    top_cat = max(cat_scores, key=cat_scores.get) if any(v > 0 for v in cat_scores.values()) else None
+    if top_cat and cat_scores[top_cat] > 0.1:
+        if top_cat == "social":
+            style_cues.append("User's language is social. Emphasize connection/shared experiences if relevant.")
+        elif top_cat == "cognitive":
+            style_cues.append("User's language is cognitive/analytical. Provide logical explanations or structured info.")
+        elif top_cat == "affect":
+            style_cues.append("User's language is affect-rich (emotional). Acknowledge feelings and respond with empathy.")
+
+    # --- Construct Final Prompt ---
     if style_cues:
-        # Add a clear separator and list the cues
-        modified_prompt = base_prompt + "\n\nIMPORTANT Style Adaptation Instructions (apply subtly):\n- " + "\n- ".join(style_cues)
+        instruction_header = "\n\n## IMPORTANT Style Adaptation Instructions (Follow Closely):\n"
+        formatted_cues = "- " + "\n- ".join(style_cues)
+        final_prompt = base_prompt + instruction_header + formatted_cues
+        return final_prompt
     else:
-        # No specific cues detected, use the base adaptive prompt
-        modified_prompt = base_prompt
+         # This should ideally not happen with the number of cues we have
+         print("Warning: No style cues generated for adaptive prompt.")
+         return base_prompt + "\n\n## Style Adaptation Instructions:\n- Maintain a generally helpful and supportive tone." # Basic fallback
 
-    return modified_prompt
 
-# --- Core Functions ---
-
-# MODIFIED function to accept style_profile and use dynamic prompt generation
+# --- Gemini API Call (with Logging) ---
 def get_gemini_response(user_prompt, chat_history, is_adaptive, show_avatar, style_profile=None):
-    """
-    Fetches a response from the configured Gemini model.
-
-    Uses dynamic system prompts for the 'Adaptive LSM' condition based on
-    the detected style profile of the user's last message.
-    """
     persona_name = DEFAULT_BOT_NAME if show_avatar else NO_AVATAR_BOT_NAME
+    error_message = None # To store potential errors for logging
+    
 
-    # --- Define BASE System Prompts ---
-    # Base prompt for the adaptive condition (cues will be added dynamically)
+    # --- Base Prompts ---
+    # Refined prompts slightly for clarity
     base_adaptive_prompt = f"""
-    You are {persona_name}, a friendly AI wellness assistant. Your goal is to provide helpful, general health and wellness information (fitness, nutrition, sleep, stress management).
-    Your tone should feel approachable, supportive, and informative.
-    You need to adapt your response style based on the user's last message, following the specific instructions below.
-    Keep responses relevant to health and wellness. Do NOT provide medical advice or diagnoses.
-    Remember the disclaimer: you are not a medical professional. If asked for medical advice, politely decline and state your limitations.
-    """
-    # Fixed prompt for the static condition
+You are {persona_name}, a friendly AI wellness assistant focused on general health topics like fitness, nutrition, sleep, and stress management.
+Your primary goal is to be helpful, supportive, and informative.
+**CRITICAL:** Adapt your response style based *only* on the user's *last* message, following the specific 'Style Adaptation Instructions' provided below.
+Keep responses relevant to health and wellness.
+**Strictly avoid giving medical advice or diagnoses.** You are not a doctor. If asked for medical advice, politely state your limitations and suggest consulting a healthcare professional.
+Example Disclaimer: "As an AI assistant, I can't provide medical advice. For diagnosis or treatment, please consult a healthcare provider."
+**IMPORTANT:** Do not preface your response with reasoning steps like 'Thinking process:', 'Step 1:', etc. Provide only the final user-facing answer.
+"""
     static_prompt = f"""
-    You are {persona_name}, a friendly AI wellness assistant. Your goal is to provide helpful, general health and wellness information (fitness, nutrition, sleep, stress management).
-    Your communication style is CONSISTENTLY: Empathetic, clear, encouraging, and informative, using moderate sentence length (around 1-3 sentences per response). Use standard, proper language without slang or excessive informality. Avoid emojis.
-    Maintain this specific style REGARDLESS of the user's writing style. Do NOT try to mimic the user.
-    Keep responses relevant to health and wellness. Do NOT provide medical advice or diagnoses.
-    Remember the disclaimer: you are not a medical professional. If asked for medical advice, politely decline and state your limitations.
-    """
+You are {persona_name}, a friendly AI wellness assistant focused on general health topics like fitness, nutrition, sleep, and stress management.
+Your primary goal is to be helpful, supportive, and informative.
+**CRITICAL:** Maintain a CONSISTENT communication style: Empathetic, clear, encouraging, and informative. Use standard, proper language with moderate sentence length (aim for 1-3 sentences per point).
+**Do NOT adapt or mimic the user's writing style (e.g., slang, emojis, sentence length).** Maintain *your* defined style regardless of how the user writes.
+Keep responses relevant to health and wellness.
+**Strictly avoid giving medical advice or diagnoses.** You are not a doctor. If asked for medical advice, politely state your limitations and suggest consulting a healthcare professional.
+Example Disclaimer: "As an AI assistant, I can't provide medical advice. For diagnosis or treatment, please consult a healthcare provider."
+**IMPORTANT:** Do not preface your response with reasoning steps like 'Thinking process:', 'Step 1:', etc. Provide only the final user-facing answer.
+"""
 
-    # --- Determine Final System Instruction ---
+    # Determine system instruction and log it
     if is_adaptive and style_profile:
-        # Generate the full prompt with dynamic style cues
-        system_instruction_text = generate_dynamic_prompt(base_adaptive_prompt, style_profile)
+        system_instruction = generate_dynamic_prompt(base_adaptive_prompt, style_profile)
+        prompt_type = "adaptive"
     else:
-        # Use the fixed static prompt if not adaptive or no profile provided
-        system_instruction_text = static_prompt
+        system_instruction = static_prompt
+        prompt_type = "static"
 
-    # --- Format Chat History for API ---
-    messages_for_api = []
-    for message in chat_history:
-        role = "model" if message["role"] == "assistant" else message["role"]
-        messages_for_api.append({"role": role, "parts": [{"text": message["content"]}]})
-    messages_for_api.append({"role": "user", "parts": [{"text": user_prompt}]}) # Add latest user prompt
+    if LOG_SESSION_EVENTS:
+        log_event({
+            "event_type": "llm_request_start",
+            "prompt_type": prompt_type,
+            "system_instruction": system_instruction,
+            "history_length": len(chat_history)
+        })
 
-    # --- Call the Gemini API ---
+    # Format message history for Gemini API
+    messages = []
+    # Add historical messages (limit history length if needed)
+    for msg in chat_history: # Make sure history has 'role' and 'content'
+         role = "model" if msg["role"] == "assistant" else "user"
+         messages.append({"role": role, "parts": [{"text": msg["content"]}]})
+    # Add the current user prompt
+    messages.append({"role": "user", "parts": [{"text": user_prompt}]})
+
+
+    processed_response = "Sorry, I encountered a problem generating a response. Please try again." # Default error response
+
     try:
-        model = genai.GenerativeModel(
-            GEMINI_MODEL_NAME,
-            system_instruction=system_instruction_text # Use the determined prompt
+        # Ensure API key is configured
+        api_key = st.secrets.get("GOOGLE_API_KEY")
+        if not api_key:
+             raise ValueError("GOOGLE_API_KEY not found in Streamlit secrets.")
+        genai.configure(api_key=api_key)
+
+        # Create the model instance with the system instruction
+        model = genai.GenerativeModel(GEMINI_MODEL_NAME, system_instruction=system_instruction)
+
+        # Make the API call
+        generation_config = genai.types.GenerationConfig(
+            # candidate_count=1, # Default is 1
+            # stop_sequences=['\n\n\n'], # Optional: stop generation on triple newline
+            # max_output_tokens=512,    # Optional: limit response length
+            temperature=0.7,        # Adjust creativity (0.0 = deterministic, 1.0 = creative)
+            # top_p=0.9,              # Optional: nucleus sampling
+            # top_k=40                # Optional: top-k sampling
         )
-        response = model.generate_content(messages_for_api)
 
-        if not response.candidates or not response.candidates[0].content.parts:
-             if response.prompt_feedback and response.prompt_feedback.block_reason:
-                 return f"Response blocked due to: {response.prompt_feedback.block_reason}. Let's try a different topic."
-             else:
-                 return "Sorry, I couldn't generate a response for that. Could you rephrase or ask about something else?"
+        safety_settings = { # Adjust safety settings if needed (be cautious)
+            # genai.types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: genai.types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            # genai.types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: genai.types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            # genai.types.HarmCategory.HARM_CATEGORY_HARASSMENT: genai.types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+            # genai.types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: genai.types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        }
 
-        return response.text
+
+        resp = model.generate_content(
+            messages,
+            generation_config=generation_config,
+            safety_settings=safety_settings
+            )
+
+        # Extract text, handling potential lack of response or blocked content
+        if resp.candidates:
+            if resp.candidates[0].content and resp.candidates[0].content.parts:
+                 raw_response = resp.candidates[0].content.parts[0].text
+            else:
+                 # Check finish reason for blocked content etc.
+                 finish_reason = resp.candidates[0].finish_reason
+                 raw_response = f"Response generation finished reason: {finish_reason}. No content available."
+                 error_message = f"Gemini Finish Reason: {finish_reason}"
+        else:
+             # Check prompt feedback for blocking reasons
+             block_reason = resp.prompt_feedback.block_reason if resp.prompt_feedback else "Unknown"
+             raw_response = f"Response generation failed. Prompt Feedback: {block_reason}"
+             error_message = f"Gemini Prompt Feedback: {block_reason}"
+
+
+        # Post-process the raw response (applies static style rules if not adaptive)
+        processed_response = post_process_response(raw_response, is_adaptive)
+
+        if LOG_SESSION_EVENTS:
+            log_event({
+                "event_type": "llm_response_success",
+                "raw_response": raw_response,
+                "processed_response": processed_response,
+                "finish_reason": str(resp.candidates[0].finish_reason) if resp.candidates else "N/A",
+                "safety_ratings": str(resp.candidates[0].safety_ratings) if resp.candidates else "N/A",
+                "token_count": resp.usage_metadata.total_token_count if resp.usage_metadata else None
+            })
 
     except Exception as e:
-        print(f"Gemini API Error Details: {type(e).__name__} - {e}")
-        return "Sorry, I encountered an error trying to respond. Please try again."
+        error_message = f"Error calling Gemini API: {e}"
+        st.error(error_message) # Show error in UI
+        print(error_message)   # Print detailed error to console/server logs
+        # Log the error
+        if LOG_SESSION_EVENTS:
+            log_event({
+                "event_type": "llm_error",
+                "error_message": str(e),
+                "user_prompt": user_prompt # Log context of error
+            })
+        # Use the default error message defined earlier
+        processed_response = "Sorry, an error occurred while trying to reach the assistant. Please check the connection or try again later."
 
 
-# --- Welcome/Disclaimer Function --- (No changes needed inside, calls are updated later)
+    return processed_response, system_instruction # Return system instruction for logging
+
+
+# --- UI Functions ---
+
+def display_participant_id_input():
+    """Shows the participant ID input screen."""
+    st.title("Welcome to the HopDoc Experiment")
+    st.markdown("Before we begin, please enter the **Participant ID** you were assigned.")
+    pid_input = st.text_input("Participant ID (e.g., 01, 15):", max_chars=4, key="pid_input")
+    if st.button("Submit ID"):
+        # Basic validation: check if it's numeric and maybe length
+        if pid_input.isdigit() and 1 <= len(pid_input) <= 4: # Allow 1 to 4 digits for flexibility
+            st.session_state.participant_id = pid_input.zfill(2) # Pad with zero if needed (e.g., 5 -> 05)
+            st.session_state.participant_id_entered = True
+
+            # Set up logging file path based on validated ID
+            timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            st.session_state.session_id = f"session_{timestamp_str}" # Unique ID for this run
+            log_filename = f"participant_{st.session_state.participant_id}_{st.session_state.session_id}.jsonl"
+            st.session_state.log_file_path = os.path.join(LOG_DIR, log_filename)
+
+            # Log session start
+            if LOG_SESSION_EVENTS:
+                 log_event({
+                    "event_type": "session_start",
+                    "initial_condition": st.session_state.experiment_condition,
+                 })
+            st.rerun()
+        else:
+            st.warning("Please enter a valid numeric Participant ID (1-4 digits).")
+
 def display_welcome_disclaimer(show_avatar_in_welcome):
-    """ Handles the multi-step welcome message and disclaimer presentation. """
+    """Multi-step welcome + disclaimer UI."""
     if 'disclaimer_step' not in st.session_state:
         st.session_state.disclaimer_step = 1
 
     col1, col2 = st.columns([0.8, 0.2], gap="medium")
-
     with col1:
         st.title("Welcome to HopDoc")
-        if st.session_state.disclaimer_step == 1:
-            st.markdown(f"""Hi there! I'm **Franko** – your friendly, fitness-focused frog! {'*(Avatar simulated)*' if not show_avatar_in_welcome else ''}\n\nOver the next **{int(SESSION_TIMEOUT_SECONDS / 60)} minutes**, feel free to ask me any questions related to health and wellness – like fitness tips, nutrition, sleep, or managing stress. Try to keep our conversation on-topic and appropriate.""")
-            if st.button("Continue"):
+        step = st.session_state.disclaimer_step
+        time_limit_minutes = int(SESSION_TIMEOUT_SECONDS / 60)
+
+        if step == 1:
+            st.markdown(
+                f"Hi there! I'm **Franko**, your friendly AI wellness assistant! "
+                f"{'*(Avatar display simulated)*' if not show_avatar_in_welcome else ''}\n\n"
+                f"For this session (approx. **{time_limit_minutes} minutes**), feel free to ask me general questions about health and wellness topics like fitness, nutrition, sleep, or stress management."
+            )
+            if st.button("Continue", key="disclaimer_1"):
                 st.session_state.disclaimer_step = 2
                 st.rerun()
-        elif st.session_state.disclaimer_step == 2:
-            st.markdown("""**⚠️ Just a heads up:**\n\nI'm **not** a medical professional, and I **can't** provide medical advice, diagnoses, or emergency support. If you're experiencing a health crisis or need medical care, **please contact a healthcare provider or emergency services.**""")
-            if st.button("Continue "):
+
+        elif step == 2:
+            st.markdown(
+                "**⚠️ Important Disclaimer:**\n\n"
+                "I am an AI simulation for a research study. I am **not** a medical professional, and **cannot** provide medical advice, diagnosis, or emergency support. "
+                "The information I provide is for general knowledge and informational purposes only, and does not constitute medical advice.\n\n"
+                "Please consult with a qualified healthcare provider for any health concerns or before making any decisions related to your health or treatment."
+                " If you think you may have a medical emergency, call your doctor or emergency services immediately."
+            )
+            if st.button("I Understand and Agree", key="disclaimer_2"):
                 st.session_state.disclaimer_step = 3
                 st.rerun()
-        elif st.session_state.disclaimer_step == 3:
-            st.markdown("""Not sure where to start? You could try asking:\n\n*   🤔 *"How can I improve my sleep routine?"*\n*   🧘 *"What are quick ways to reduce stress during the day?"*\n\nHave fun, and let's leap into wellness together!""")
-            if st.button("Let's Begin!"):
+
+        else: # Step 3
+            st.markdown(
+                "Great! We're ready to start.\n\n"
+                "Remember, you can ask about things like:\n"
+                "* 🤔 \"How can I create a better sleep routine?\"\n"
+                "* 🍎 \"What are some healthy snack ideas?\"\n"
+                "* 🧘 \"Suggest simple ways to manage daily stress.\"\n"
+            )
+            if st.button("Let's Begin Chatting!", key="disclaimer_3"):
                 st.session_state.disclaimer_accepted = True
                 st.session_state.start_time = time.time()
-                st.session_state.messages = [] # Clear chat history
+                st.session_state.messages = [] # Initialize message list
+                st.session_state.session_timed_out = False # Ensure timeout flag is reset
 
-                # --- Generate initial greeting ---
-                # For the initial greeting, we don't have user input yet, so no style profile.
-                # We'll use the base prompt appropriate for the starting condition.
-                initial_greeting = get_gemini_response(
-                    user_prompt="<User just started the chat>", # Placeholder
+                # Log acceptance and generate initial greeting
+                if LOG_SESSION_EVENTS:
+                    log_event({
+                        "event_type": "disclaimer_accepted",
+                        "condition": st.session_state.experiment_condition,
+                    })
+
+                # Generate initial greeting (no user input context yet)
+                initial_style_profile = None # No user input yet
+                initial_greeting, system_instr = get_gemini_response(
+                    user_prompt="<System Initiated Conversation Start>", # Special marker
                     chat_history=[],
                     is_adaptive=st.session_state.experiment_condition['lsm'],
                     show_avatar=st.session_state.experiment_condition['avatar'],
-                    style_profile=None # No profile for initial greeting
+                    style_profile=initial_style_profile
                 )
-                small_avatar_icon = AVATAR_IMAGE_PATH if st.session_state.experiment_condition['avatar'] else None
+
+                # Log the initial bot message
+                if LOG_SESSION_EVENTS:
+                    log_event({
+                        "event_type": "bot_response",
+                        "turn_number": 0, # Initial turn
+                        "user_prompt": "<System Initiated Conversation Start>",
+                        "style_profile": initial_style_profile, # Will be None
+                        "lsm_score": None, # No user input to compare
+                        "system_instruction_used": system_instr, # Log the prompt used
+                        "bot_response_raw": initial_greeting, # Log raw before post-processing (though likely same here)
+                        "bot_response_processed": initial_greeting,
+                        "condition": st.session_state.experiment_condition
+                    })
+
+                # Add greeting to messages
                 st.session_state.messages.append({
                     "role": "assistant",
                     "content": initial_greeting,
-                    "small_avatar_used": small_avatar_icon
-                    # No style profile for the bot's initial message
-                })
-                st.rerun()
+                    "small_avatar_used": AVATAR_IMAGE_PATH if st.session_state.experiment_condition['avatar'] else None
+                 })
+
+                st.rerun() # Rerun to display the chat interface
 
     with col2:
+        # Show avatar during disclaimer steps if condition requires it
         if show_avatar_in_welcome and st.session_state.disclaimer_step <= 3:
-             try:
-                st.image(AVATAR_IMAGE_PATH, width=100)
-             except FileNotFoundError:
-                 st.warning(f"Avatar image '{AVATAR_IMAGE_PATH}' not found.")
-             except Exception as e:
-                 st.error(f"Error loading welcome avatar: {e}")
+            if os.path.exists(AVATAR_IMAGE_PATH):
+                st.image(AVATAR_IMAGE_PATH, width=120)
+            else:
+                st.caption("(Avatar image not found)")
 
-# --- Initialize Session State ---
-if 'messages' not in st.session_state: st.session_state.messages = []
-if 'disclaimer_accepted' not in st.session_state: st.session_state.disclaimer_accepted = False
-if 'experiment_condition' not in st.session_state: st.session_state.experiment_condition = {'avatar': True, 'lsm': True}
-if 'start_time' not in st.session_state: st.session_state.start_time = None
 
-# --- Sidebar: Experiment Controls ---
+# --- Session State Initialization ---
+# Check for essential states, initialize if missing
+if 'participant_id_entered' not in st.session_state:
+    st.session_state.participant_id_entered = False
+if 'participant_id' not in st.session_state:
+    st.session_state.participant_id = None
+if 'log_file_path' not in st.session_state:
+    st.session_state.log_file_path = None
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = None # Will be set after PID entry
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
+if 'disclaimer_accepted' not in st.session_state:
+    st.session_state.disclaimer_accepted = False
+if 'experiment_condition' not in st.session_state:
+    # Default condition - this might be set externally in a real experiment setup
+    st.session_state.experiment_condition = {'avatar': True, 'lsm': True}
+if 'start_time' not in st.session_state:
+    st.session_state.start_time = None
+if 'lsm_score' not in st.session_state:
+    st.session_state.lsm_score = None # Store the *last* calculated score
+if 'session_timed_out' not in st.session_state:
+    st.session_state.session_timed_out = False
+if 'smoothed_lsm_score' not in st.session_state:
+    st.session_state.smoothed_lsm_score = 0.5 # Initialize at neutral midpoint    
+
+# --- Sidebar Controls (Consider disabling after start for experiment) ---
+# For prototyping, keep enabled. For actual experiment, you might lock these.
+sidebar_disabled = st.session_state.get('disclaimer_accepted', False) # Disable after chat starts?
+
 st.sidebar.title("Experiment Setup")
-st.sidebar.write("*(Control Panel for Researcher)*")
-avatar_option = st.sidebar.radio("Avatar Presence:", ('Avatar Visible', 'No Avatar'), index=0 if st.session_state.experiment_condition['avatar'] else 1, key="avatar_radio")
-lsm_option = st.sidebar.radio("Linguistic Style:", ('Adaptive LSM (Simulated)', 'Static Style'), index=0 if st.session_state.experiment_condition['lsm'] else 1, key="lsm_radio")
+st.sidebar.markdown("*(Note: For a real experiment, these settings would likely be fixed per participant.)*")
 
-# --- NEW: Debug Mode Toggle ---
-debug_mode = st.sidebar.checkbox("🔍 Show Detected Style Traits (Pilot Mode)", value=False, key="debug_mode")
+# Load current state for radio buttons
+current_avatar_index = 0 if st.session_state.experiment_condition.get('avatar', True) else 1
+current_lsm_index = 0 if st.session_state.experiment_condition.get('lsm', True) else 1
 
-show_avatar_setting = (avatar_option == 'Avatar Visible')
-use_adaptive_lsm_setting = (lsm_option == 'Adaptive LSM (Simulated)')
+avatar_option = st.sidebar.radio(
+    "Avatar Presence:",
+    ('Avatar Visible', 'No Avatar'),
+    index=current_avatar_index,
+    key='avatar_radio',
+    # disabled=sidebar_disabled # Uncomment to lock after start
+)
+lsm_option = st.sidebar.radio(
+    "Linguistic Style:",
+    ('Adaptive LSM (Simulated)', 'Static Style'),
+    index=current_lsm_index,
+    key='lsm_radio',
+    # disabled=sidebar_disabled # Uncomment to lock after start
+)
+debug_mode = st.sidebar.checkbox("🔍 Show Debug Info (Style/LSM)", value=False, key='debug_check')
 
-if st.session_state.experiment_condition['avatar'] != show_avatar_setting or \
-   st.session_state.experiment_condition['lsm'] != use_adaptive_lsm_setting:
-    st.session_state.experiment_condition['avatar'] = show_avatar_setting
-    st.session_state.experiment_condition['lsm'] = use_adaptive_lsm_setting
-    # Consider resetting chat/timer if conditions change mid-interaction during testing
+# Update session state if changes are made *before* disclaimer is accepted
+# (Prevents changing conditions mid-conversation easily)
+if not sidebar_disabled:
+    show_avatar_setting = (avatar_option == 'Avatar Visible')
+    use_adaptive_lsm = (lsm_option == 'Adaptive LSM (Simulated)')
+
+    condition_changed = False
+    if st.session_state.experiment_condition.get('avatar') != show_avatar_setting:
+        st.session_state.experiment_condition['avatar'] = show_avatar_setting
+        condition_changed = True
+    if st.session_state.experiment_condition.get('lsm') != use_adaptive_lsm:
+        st.session_state.experiment_condition['lsm'] = use_adaptive_lsm
+        condition_changed = True
+
+    # # Optional: If condition changes before start, maybe reset disclaimer?
+    # if condition_changed:
+    #      st.session_state.disclaimer_step = 1
+    #      # No rerun here, let the natural flow handle it
 
 st.sidebar.markdown("---")
-st.sidebar.write(f"**Current Condition:**")
-st.sidebar.write(f"- Avatar: {'Yes' if st.session_state.experiment_condition['avatar'] else 'No'}")
-st.sidebar.write(f"- Style: {'Adaptive (Simulated)' if st.session_state.experiment_condition['lsm'] else 'Static'}")
+st.sidebar.write(f"**Participant ID:** {st.session_state.participant_id if st.session_state.participant_id else 'Not Set'}")
+st.sidebar.write(f"**Assigned Condition:**")
+st.sidebar.write(f"- Avatar: {'Yes' if st.session_state.experiment_condition.get('avatar') else 'No'}")
+st.sidebar.write(f"- Style: {'Adaptive' if st.session_state.experiment_condition.get('lsm') else 'Static'}")
+st.sidebar.write(f"**Log File:** {os.path.basename(st.session_state.log_file_path) if st.session_state.log_file_path else 'Not Set'}")
 
-# --- Main App Interface ---
-if not st.session_state.disclaimer_accepted:
-    display_welcome_disclaimer(show_avatar_in_welcome=st.session_state.experiment_condition['avatar'])
+
+# --- Main Application Flow ---
+
+# 1. Check for Participant ID
+if not st.session_state.participant_id_entered:
+    display_participant_id_input()
+
+# 2. Check for Disclaimer Acceptance (only if ID entered)
+elif not st.session_state.disclaimer_accepted:
+    display_welcome_disclaimer(st.session_state.experiment_condition['avatar'])
+
+# 3. Run the Chat Application (only if ID entered and disclaimer accepted)
 else:
-    st.title("Chat with HopDoc")
-    time_limit_reached = False
-    if st.session_state.start_time:
-        elapsed_time = time.time() - st.session_state.start_time
-        minutes, seconds = divmod(elapsed_time, 60)
-        timer_display = f"Time elapsed: {int(minutes):02}:{int(seconds):02} / {int(SESSION_TIMEOUT_SECONDS / 60):02}:00"
-        time_limit_reached = elapsed_time > SESSION_TIMEOUT_SECONDS
-    else:
-        timer_display = "Timer not started."
+    st.title(f"Chat with {DEFAULT_BOT_NAME if st.session_state.experiment_condition['avatar'] else NO_AVATAR_BOT_NAME}")
 
-    avatar_col, chat_col = st.columns([0.3, 0.7], gap="large")
+    # --- Timeout Check ---
+    elapsed_time = time.time() - st.session_state.start_time
+    remaining_time = SESSION_TIMEOUT_SECONDS - elapsed_time
 
-    with avatar_col: # Avatar column
-        if st.session_state.experiment_condition['avatar']:
-            try: st.image(AVATAR_IMAGE_PATH, use_container_width=True)
-            except FileNotFoundError: st.warning(f"Large avatar image '{AVATAR_IMAGE_PATH}' not found.")
-            except Exception as e: st.error(f"Error loading large avatar: {e}")
-        else: st.write("")
-
-    with chat_col: # Chat column
-        st.caption(timer_display)
-        if time_limit_reached:
-            st.warning("Interaction time limit reached. Please complete the survey.")
-
-        use_small_avatar_icon = None # Not using small icon if large avatar present
-
-        # Display chat history
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"], avatar=message.get("small_avatar_used")):
-                st.markdown(message["content"])
-                # --- NEW: Optionally display stored style profile in debug mode ---
-                if debug_mode and message["role"] == "user" and "style_profile" in message:
-                    st.caption("Detected Style:")
-                    st.json(message["style_profile"], expanded=False)
-
-
-        # Handle user input
-        if prompt := st.chat_input("What health questions do you have?", disabled=time_limit_reached, key="chat_input"):
-
-            # --- Detect user style FIRST ---
-            user_style_profile = detect_style_traits(prompt)
-
-            # 1. Display and store user message (including style profile)
-            with st.chat_message("user"):
-                st.markdown(prompt)
-                # Display detected traits under user message if debug mode is on
-                if debug_mode:
-                    st.caption("Detected Style:")
-                    st.json(user_style_profile, expanded=False)
-
-            st.session_state.messages.append({
-                "role": "user",
-                "content": prompt,
-                "small_avatar_used": None,
-                "style_profile": user_style_profile # Store detected profile
+    if remaining_time <= 0 and not st.session_state.session_timed_out:
+        st.session_state.session_timed_out = True
+        st.warning("The session time limit has been reached. Thank you for your participation!")
+        if LOG_SESSION_EVENTS:
+            log_event({
+                "event_type": "session_timeout",
+                "duration_seconds": elapsed_time
             })
+        # Consider adding a final message or survey link here
+        st.stop() # Stop further execution below this point for this run
 
-            # --- Display detected traits in sidebar if debug mode is on ---
+    # Display remaining time
+    st.caption(f"Time remaining: {int(remaining_time // 60)} min {int(remaining_time % 60)} sec")
+    if st.session_state.session_timed_out:
+        st.info("Session ended due to time limit. Input is disabled.")
+
+
+    # --- Display Chat History ---
+    for i, msg in enumerate(st.session_state.messages):
+        avatar = msg.get("small_avatar_used") # Use stored avatar path or None
+        with st.chat_message(msg["role"], avatar=avatar):
+            st.markdown(msg["content"])
+            # Optionally show debug info stored with user messages
+            if debug_mode and msg["role"] == "user" and "style_profile" in msg:
+                 with st.expander("Detected User Style Traits (Turn " + str(msg.get('turn_number', '?')) + ")", expanded=False):
+                      st.json(msg["style_profile"])
+            # Optionally show LSM score calculated *after* the bot response this message follows
+            if debug_mode and msg["role"] == "assistant" and "lsm_score" in msg:
+                 st.caption(f"LSM vs Prev User Msg: {msg['lsm_score']:.3f}")
+
+
+    # --- Handle User Input ---
+    # Disable input if session has timed out
+    chat_input_disabled = st.session_state.session_timed_out
+    prompt = st.chat_input("What health questions do you have?", disabled=chat_input_disabled, key="chat_input")
+
+    if prompt:
+        current_turn = len([m for m in st.session_state.messages if m['role'] == 'user']) + 1
+
+        # 1. Detect User Style for CURRENT prompt
+        profile = detect_style_traits(prompt)
+
+        # 2. Prepare for API call: Add PREVIOUS smoothed LSM score to the profile
+        # This is the score that influences the *upcoming* bot response style
+        if st.session_state.smoothed_lsm_score is not None:
+             profile["lsm_score_prev"] = st.session_state.smoothed_lsm_score
+        else:
+             # Default for the very first turn if needed
+             profile["lsm_score_prev"] = 0.5
+
+        # 3. Display User Message & Log (with profile containing PREVIOUS smoothed LSM)
+        avatar_to_display = None # Users don't have an avatar in this setup
+        with st.chat_message("user", avatar=avatar_to_display):
+            st.markdown(prompt)
             if debug_mode:
-                 st.sidebar.markdown("---")
-                 st.sidebar.markdown("### 🧠 Last User Style Detected")
-                 st.sidebar.json(user_style_profile)
+                # Display the detected traits, including the smoothed LSM score used for the *next* bot response
+                with st.expander(f"Detected User Style Traits (Turn {current_turn}) & Prev Smoothed LSM", expanded=True):
+                    st.json(profile)
 
+        # Add user message to state *before* calling the API
+        # Profile stored here includes the 'lsm_score_prev' used for the next bot generation
+        user_message_data = {
+            "role": "user",
+            "content": prompt,
+            "style_profile": profile,
+            "turn_number": current_turn
+        }
+        st.session_state.messages.append(user_message_data)
 
-            # 2. Generate and display assistant response
-            with st.chat_message("assistant", avatar=use_small_avatar_icon):
-                with st.spinner("Thinking..."):
-                    # --- Pass detected style profile to the LLM function ---
-                    response = get_gemini_response(
-                        prompt, # Pass current prompt for context if needed by function logic
-                        chat_history=st.session_state.messages[:-1], # Pass history *before* this user turn
-                        is_adaptive=st.session_state.experiment_condition['lsm'],
-                        show_avatar=st.session_state.experiment_condition['avatar'],
-                        style_profile=user_style_profile # Pass the detected profile
-                    )
-                    st.markdown(response)
+        # Log user message event
+        if LOG_SESSION_EVENTS:
+             log_event({
+                "event_type": "user_message",
+                "turn_number": current_turn,
+                "user_prompt": prompt,
+                "style_profile": profile, # Contains prev smoothed LSM
+                "condition": st.session_state.experiment_condition
+             })
 
-            # 3. Store assistant response
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": response,
-                "small_avatar_used": use_small_avatar_icon
-                # Could add bot style profile here later if needed
-            })
+        # 4. Generate Bot Response
+        with st.chat_message("assistant", avatar=(AVATAR_IMAGE_PATH if st.session_state.experiment_condition['avatar'] else None)):
+            with st.spinner("HopDoc is thinking..."):
+                # Get response and the system instruction actually used
+                bot_response, system_instr_used = get_gemini_response(
+                    user_prompt=prompt,
+                    # History includes all messages *before* the current user prompt was appended
+                    chat_history=st.session_state.messages[:-1],
+                    is_adaptive=st.session_state.experiment_condition["lsm"],
+                    show_avatar=st.session_state.experiment_condition["avatar"],
+                    # Pass the profile containing the previous smoothed LSM score
+                    style_profile=profile
+                )
 
-            st.rerun() # Rerun for immediate UI update
+                # --- Calculate and Smooth LSM FOR THIS TURN ---
+                # Tokenize texts for length checks and score calculation
+                user_tokens = tokenize_text(prompt)
+                bot_tokens = tokenize_text(bot_response)
+                user_token_count = len(user_tokens)
+                bot_token_count = len(bot_tokens)
+
+                # Calculate the raw LSM score for THIS turn (user vs bot)
+                raw_turn_lsm = compute_lsm_score(prompt, bot_response)
+
+                # Store raw score in session state temporarily for logging/display with bot message
+                st.session_state.lsm_score = raw_turn_lsm
+
+                # Determine if smoothed score should be updated
+                update_smoothed_lsm = True
+                lsm_reason = ""
+
+                if user_token_count < MIN_LSM_TOKENS:
+                    update_smoothed_lsm = False
+                    lsm_reason += f"User ({user_token_count}) < {MIN_LSM_TOKENS} tokens. "
+                if bot_token_count < MIN_LSM_TOKENS:
+                    update_smoothed_lsm = False
+                    lsm_reason += f"Bot ({bot_token_count}) < {MIN_LSM_TOKENS} tokens."
+
+                # Calculate the new smoothed LSM score (used for the *next* prompt)
+                if update_smoothed_lsm:
+                    prev_smoothed_lsm = st.session_state.smoothed_lsm_score
+                    new_smoothed_lsm = (LSM_SMOOTHING_ALPHA * raw_turn_lsm) + ((1 - LSM_SMOOTHING_ALPHA) * prev_smoothed_lsm)
+                    st.session_state.smoothed_lsm_score = new_smoothed_lsm # Update state
+                    lsm_reason = f"Smoothed Score Updated: {new_smoothed_lsm:.3f}"
+                else:
+                    lsm_reason += "Smoothed Score Not Updated."
+                    # Keep the previous value if not updated
+                    new_smoothed_lsm = st.session_state.smoothed_lsm_score
+
+            # Display bot response
+            st.markdown(bot_response)
+            if debug_mode:
+                st.caption(f"Raw Turn LSM: {raw_turn_lsm:.3f} | {lsm_reason}")
+                with st.expander("System Prompt Used", expanded=False):
+                     st.text(system_instr_used)
+
+        # 5. Store Bot Message & Log
+        bot_message_data = {
+             "role": "assistant",
+             "content": bot_response,
+             "lsm_score": raw_turn_lsm, # Log the RAW score calculated for this turn
+             "smoothed_lsm_after_turn": new_smoothed_lsm, # Log the smoothed value AFTER this turn
+             "system_instruction_used": system_instr_used,
+             "turn_number": current_turn,
+             "small_avatar_used": AVATAR_IMAGE_PATH if st.session_state.experiment_condition['avatar'] else None
+        }
+        st.session_state.messages.append(bot_message_data)
+
+        if LOG_SESSION_EVENTS:
+             log_event({
+                 "event_type": "bot_response",
+                 "turn_number": current_turn,
+                 "user_prompt": prompt,
+                 "style_profile": profile, # Profile used for THIS response generation
+                 "lsm_score_raw_turn": raw_turn_lsm,
+                 "smoothed_lsm_after_turn": new_smoothed_lsm, # Log the state *after* this turn
+                 "lsm_update_reason": lsm_reason,
+                 "system_instruction_used": system_instr_used,
+                 "bot_response_processed": bot_response,
+                 "condition": st.session_state.experiment_condition
+             })
+        st.rerun()
